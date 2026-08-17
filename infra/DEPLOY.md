@@ -198,6 +198,39 @@ cargo lambda deploy gate-api \
   --enable-function-url
 ```
 
+### ⚠️ この URL は、知っている人なら誰でも叩けます
+
+`--enable-function-url` が作る Function URL は、**認証タイプが `NONE`** です。
+このシステムは認証を意図的に入れていないので（README「認証は、意図的に実装していません」）、
+**URL を知っていれば、誰でも要求を投げられ、承認も拒否もできます。**
+
+そう分かったうえで動かす、という前提です。実害を小さくしている条件は3つ。
+
+- **投入するのは架空のデータだけ**（仕様書9章。実在の個人情報は入れない）
+- **予算アラートが先に入っている**（手順0）
+- **その日のうちに止める**（手順7）
+
+URL は推測しにくい文字列ですが、**推測されにくいだけで、秘密ではありません。**
+
+> **【重要】スクリーンショットと出力に URL が写り込みます。**
+> README に貼るとき、`infra/evidence/` を共有するときは、URL を伏せてください。
+> リポジトリを公開したあとで気づいても、履歴からは消えません。
+
+```bash
+# 確認: AuthType が NONE であること（そう表示されるのが想定どおり）
+aws lambda get-function-url-config --function-name gate-api \
+  --query '{url:FunctionUrl, auth:AuthType}'
+```
+
+**IAM 認証に変えることもできます**が、その場合は curl も画面も SigV4 で署名する必要があり、
+README に載せている「curl でそのまま叩ける」形が崩れます。
+短時間で止める前提なら、`NONE` のままで進めるほうが筋が通ると考えています。
+
+```bash
+# もし IAM 認証に変える場合（curl は署名が要るようになります）
+aws lambda update-function-url-config --function-name gate-api --auth-type AWS_IAM
+```
+
 **【重要】ログの保持期間を必ず設定します。既定は無期限で、静かに溜まり続けます。**
 
 ```bash
@@ -370,6 +403,7 @@ cat infra/evidence/teardown.txt
 | ☐ | 3. DynamoDB 3テーブル ＋ TTL ＋ PITR | — |
 | ☐ | 4. IAM ロール（Deny つき） | — |
 | ☐ | 5. Lambda ＋ **ログ保持7日** | — |
+| ☐ | 5. **Function URL が `NONE`（誰でも叩ける）と確認** | `get-function-url-config` の出力 |
 | ☐ | 6. 動作確認 | `aws-run.txt` |
 | ☐ | 6. **IAM Simulator で Deny を証明** | `iam-simulate-audit.json` |
 | ☐ | 6. スクリーンショット | `*.png` |
