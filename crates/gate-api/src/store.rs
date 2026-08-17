@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gate_core::mask::MaskPlan;
 use gate_core::review::{AuditEntry, Verdict};
@@ -66,6 +67,14 @@ pub trait RequestStore: Send + Sync {
     /// 監査ログ。**追記のみ。** 消す関数も直す関数も用意しない。
     fn append_audit(&self, entry: AuditEntry);
     fn audit_log(&self) -> Vec<AuditEntry>;
+
+    /// 状態が変わるたびに増える番号。
+    ///
+    /// 【重要】ポーリングを安くするためのものです（第5段階）。
+    /// 画面は数秒ごとに一覧を取りに来ますが、承認待ちは1日に数件しか増えません。
+    /// この番号を ETag にして、変わっていなければ 304 を返せば、
+    /// 本文を作らず、JSON にもせずに済みます。
+    fn version(&self) -> u64;
 }
 
 /// メモリ上の実装。
@@ -78,6 +87,8 @@ pub struct InMemoryStore {
     requests: RwLock<HashMap<String, StoredRequest>>,
     order: RwLock<Vec<String>>,
     audit: RwLock<Vec<AuditEntry>>,
+    /// 状態が変わった回数。ETag に使う。
+    version: AtomicU64,
 }
 
 impl InMemoryStore {
@@ -91,6 +102,7 @@ impl RequestStore for InMemoryStore {
         let id = request.id.clone();
         self.requests.write().unwrap().insert(id.clone(), request);
         self.order.write().unwrap().push(id);
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
 
     fn get(&self, id: &str) -> Option<StoredRequest> {
@@ -129,6 +141,7 @@ impl RequestStore for InMemoryStore {
             return None;
         }
         request.state = state;
+        self.version.fetch_add(1, Ordering::Relaxed);
         Some(request.clone())
     }
 
@@ -138,5 +151,9 @@ impl RequestStore for InMemoryStore {
 
     fn audit_log(&self) -> Vec<AuditEntry> {
         self.audit.read().unwrap().clone()
+    }
+
+    fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
     }
 }

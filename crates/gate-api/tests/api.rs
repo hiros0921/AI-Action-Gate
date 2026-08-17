@@ -433,6 +433,138 @@ async fn データ区分の申告が無い要求を公開扱いにしないこ�
 }
 
 #[tokio::test]
+async fn 変わっていなければ本文を返さないこと() {
+    // 【重要】ポーリングを安くする仕組み（第5段階）。
+    // 画面は数秒ごとに来るが、承認待ちは1日に数件しか増えない。
+    let (app, _) = app();
+    post(&app, "/api/requests", high_request()).await;
+
+    let first = app
+        .clone()
+        .oneshot(Request::get("/api/queue").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let etag = first
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // 同じ ETag で聞き直すと 304。本文は作られない。
+    let again = app
+        .clone()
+        .oneshot(
+            Request::get("/api/queue")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    assert!(
+        again
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty(),
+        "304 なのに本文を作っている"
+    );
+
+    // 1件増えたら ETag が変わる。
+    post(&app, "/api/requests", medium_request()).await;
+    let after = app
+        .clone()
+        .oneshot(
+            Request::get("/api/queue")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        StatusCode::OK,
+        "変わったのに 304 を返している"
+    );
+}
+
+#[tokio::test]
+async fn ポーリング間隔をサーバが持つこと() {
+    // 【重要】諏訪の指示（第5段階）:
+    //   「304 でも Lambda の呼び出し回数はカウントされる。間隔がそのまま費用に効く。
+    //     ハードコードすると、費用を測ったあとに調整できません」
+    let state = Arc::new(AppState::with_poll_interval(
+        Arc::new(InMemoryStore::new()),
+        Policy::adopted(),
+        7_000,
+    ));
+    let app = routes::router(state);
+    let (status, body) = get(&app, "/api/settings").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["poll_interval_ms"], 7000,
+        "画面が使う間隔がサーバから来ていない"
+    );
+    assert_eq!(body["adopted"], true);
+    assert_eq!(body["thresholds"]["medium_at"], 20);
+}
+
+#[tokio::test]
+async fn 履歴に誰がどう判断したかが残ること() {
+    let (app, _) = app();
+    let (_, submitted) = post(&app, "/api/requests", high_request()).await;
+    let id = submitted["request_id"].as_str().unwrap().to_string();
+    post_as(
+        &app,
+        &format!("/api/requests/{id}/decision"),
+        "suwa",
+        json!({ "verdict": "approve" }),
+    )
+    .await;
+
+    let (_, history) = get(&app, "/api/history").await;
+    let item = &history.as_array().unwrap()[0];
+    assert_eq!(item["request_id"], id);
+    assert_eq!(item["reviewer"], "suwa");
+    assert_eq!(item["verdict"], "approved");
+    // HIGH をそのまま承認したことが分かること。
+    assert_eq!(item["overrode_machine"], true);
+
+    // 承認待ちのものは履歴に出ない。
+    post(&app, "/api/requests", high_request()).await;
+    let (_, history) = get(&app, "/api/history").await;
+    assert_eq!(history.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn 履歴に平文が残らないこと() {
+    let (app, _) = app();
+    let (_, submitted) = post(&app, "/api/requests", high_request()).await;
+    let id = submitted["request_id"].as_str().unwrap().to_string();
+    post_as(
+        &app,
+        &format!("/api/requests/{id}/decision"),
+        "suwa",
+        json!({ "verdict": "approve" }),
+    )
+    .await;
+
+    let (_, history) = get(&app, "/api/history").await;
+    let text = history.to_string();
+    for leak in ["山田", "太郎", "1980", "5678"] {
+        assert!(!text.contains(leak), "履歴に平文が混ざっている: {leak}");
+    }
+}
+
+#[tokio::test]
 async fn 設定の版が画面から見えること() {
     // 第4段階までは暫定であることが分かるようにしておく。
     let (app, _) = app();

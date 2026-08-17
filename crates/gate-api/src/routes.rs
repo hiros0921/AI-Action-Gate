@@ -9,7 +9,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use gate_core::action::ActionRequest;
 use gate_core::detect::{self, DetectConfig};
@@ -29,6 +29,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/requests/{id}", get(fetch))
         .route("/api/requests/{id}/decision", post(decide))
         .route("/api/queue", get(queue))
+        .route("/api/history", get(history))
+        .route("/api/settings", get(settings))
         .route("/api/audit", get(audit))
         .route("/api/policy", get(policy))
         .route("/api/simulate", post(simulate))
@@ -218,33 +220,133 @@ pub struct QueueItem {
     pub masked_preview: String,
 }
 
-async fn queue(State(state): State<Arc<AppState>>) -> Json<Vec<QueueItem>> {
-    Json(
-        state
-            .store
-            .pending()
-            .into_iter()
-            .map(|r| {
-                let masked = r.mask_plan.apply(&r.payload);
-                QueueItem {
-                    request_id: r.id,
-                    agent_id: r.agent_id,
-                    created_at: r.created_at,
-                    risk: r.assessment.decision,
-                    score: r.assessment.score,
-                    thresholds: r.assessment.thresholds,
-                    policy_version: r.assessment.policy_version.clone(),
-                    components: r.assessment.components.clone(),
-                    detected: r.assessment.detected.clone(),
-                    clamped: r.assessment.clamped,
-                    conclusive: r.assessment.conclusive,
-                    raised_by_uncertainty: r.assessment.raised_by_uncertainty,
-                    payload: r.payload,
-                    masked_preview: masked,
-                }
-            })
-            .collect(),
-    )
+/// 承認待ち一覧。
+///
+/// <div class="warning">
+///
+/// 【重要】ETag を付けています（第5段階）。
+///
+/// 画面は数秒ごとに取りに来ますが、承認待ちは1日に数件しか増えません。
+/// 変わっていなければ **304 を返して本文を作りません**。
+/// JSON 化も、平文のマスキングも走らないので、待ち件数が増えても
+/// ポーリングの費用が比例して増えることはありません。
+///
+/// ただし **Lambda の呼び出し回数そのものは減りません**（304 でも1回は数えられる）。
+/// だから間隔のほうを設定で変えられるようにしてあります（`GATE_POLL_MS`）。
+///
+/// </div>
+async fn queue(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap) -> Response {
+    let etag = format!("\"q{}\"", state.store.version());
+    if headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        == Some(etag.as_str())
+    {
+        return (StatusCode::NOT_MODIFIED, [("etag", etag)]).into_response();
+    }
+    let body = queue_items(&state);
+    (StatusCode::OK, [("etag", etag)], Json(body)).into_response()
+}
+
+fn queue_items(state: &AppState) -> Vec<QueueItem> {
+    (state
+        .store
+        .pending()
+        .into_iter()
+        .map(|r| {
+            let masked = r.mask_plan.apply(&r.payload);
+            QueueItem {
+                request_id: r.id,
+                agent_id: r.agent_id,
+                created_at: r.created_at,
+                risk: r.assessment.decision,
+                score: r.assessment.score,
+                thresholds: r.assessment.thresholds,
+                policy_version: r.assessment.policy_version.clone(),
+                components: r.assessment.components.clone(),
+                detected: r.assessment.detected.clone(),
+                clamped: r.assessment.clamped,
+                conclusive: r.assessment.conclusive,
+                raised_by_uncertainty: r.assessment.raised_by_uncertainty,
+                payload: r.payload,
+                masked_preview: masked,
+            }
+        })
+        .collect::<Vec<_>>(),)
+        .0
+}
+
+/// 判断が済んだ要求の履歴。
+#[derive(Debug, Serialize)]
+pub struct HistoryItem {
+    pub request_id: String,
+    pub agent_id: String,
+    pub created_at: String,
+    pub decided_at: String,
+    pub risk: Decision,
+    pub score: u8,
+    pub verdict: Verdict,
+    pub reviewer: String,
+    pub detected: Vec<gate_core::detect::KindCount>,
+    /// 人が自動判定を覆したか。HIGH をそのまま承認した、など。
+    pub overrode_machine: bool,
+}
+
+async fn history(State(state): State<Arc<AppState>>) -> Json<Vec<HistoryItem>> {
+    let items = state
+        .store
+        .all()
+        .into_iter()
+        .filter_map(|r| match r.state {
+            RequestState::Pending => None,
+            RequestState::Settled {
+                verdict,
+                reviewer,
+                at,
+                ..
+            } => Some(HistoryItem {
+                request_id: r.id,
+                agent_id: r.agent_id,
+                created_at: r.created_at,
+                decided_at: at,
+                risk: r.assessment.decision,
+                score: r.assessment.score,
+                verdict,
+                reviewer,
+                detected: r.assessment.detected.clone(),
+                overrode_machine: match verdict {
+                    Verdict::Approved => r.assessment.decision == Decision::High,
+                    Verdict::Rejected => r.assessment.decision == Decision::Low,
+                    Verdict::ApprovedWithMasking => false,
+                },
+            }),
+        })
+        .collect();
+    Json(items)
+}
+
+/// 画面が動くのに要る設定。
+#[derive(Debug, Serialize)]
+pub struct SettingsResponse {
+    /// ポーリング間隔（ミリ秒）。**画面に埋め込まない**（第5段階の指示）。
+    pub poll_interval_ms: u64,
+    pub policy_version: String,
+    pub policy_label: String,
+    pub adopted: bool,
+    pub thresholds: Thresholds,
+}
+
+async fn settings(State(state): State<Arc<AppState>>) -> Json<SettingsResponse> {
+    let p = state.policy();
+    Json(SettingsResponse {
+        // 【重要】間隔はサーバが持ちます。画面に書くと、費用を測ったあとに
+        // 画面を作り直さないと調整できません。
+        poll_interval_ms: state.poll_interval_ms(),
+        adopted: p.version.starts_with("adopted"),
+        policy_version: p.version.clone(),
+        policy_label: p.label.clone(),
+        thresholds: p.thresholds,
+    })
 }
 
 #[derive(Debug, Deserialize)]

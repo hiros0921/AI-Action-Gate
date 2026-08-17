@@ -15,3 +15,6 @@ dashboard/build/
 .idea/
 .vscode/
 .zed/
+
+# ダッシュボードのビルド生成物
+dashboard/dist/
