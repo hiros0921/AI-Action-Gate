@@ -1,0 +1,15 @@
+[package]
+name = "gate-agent"
+description = "疑似エージェント。JSON を投げて、request_id で結果を取りに行く"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gate-core = { path = "../gate-core" }
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

@@ -57,9 +57,11 @@ pub mod action;
 pub mod detect;
 pub mod mask;
 pub mod policy;
+pub mod review;
 pub mod score;
 
 pub use action::{ActionKind, ActionRequest, DataClass, Destination, Payload};
 pub use detect::{Confidence, PiiKind, Scan};
 pub use policy::{Decision, Policy, Thresholds};
+pub use review::{AuditEntry, Reviewer, Verdict};
 pub use score::{RiskAssessment, assess};
