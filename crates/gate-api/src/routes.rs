@@ -350,7 +350,7 @@ async fn policy(State(state): State<Arc<AppState>>) -> Json<PolicyResponse> {
         version: p.version.clone(),
         label: p.label.clone(),
         thresholds: p.thresholds,
-        weights: p.weights.clone(),
+        weights: p.weights,
     })
 }
 

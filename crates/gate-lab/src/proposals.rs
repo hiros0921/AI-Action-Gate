@@ -95,7 +95,7 @@ impl WeightProposal {
             version: format!("weight-{}", self.id.to_lowercase()),
             label: format!("案{}・{}", self.id, self.label),
             thresholds: FIXED_THRESHOLDS,
-            weights: self.weights.clone(),
+            weights: self.weights,
             ..Policy::provisional()
         }
     }
