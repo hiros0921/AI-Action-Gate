@@ -1,0 +1,19 @@
+# ワークスペース。判定コアと、あとから足すサーバ・永続化・疑似エージェントを分ける。
+#
+# 【重要】gate-core には tokio も axum も aws-sdk も入れない。
+# 判定ロジックを I/O から独立させるという要件（仕様書4章）を、
+# 依存関係の側で守らせる。うっかり混ざったらコンパイルが通らない。
+[workspace]
+resolver = "3"
+members = ["crates/gate-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+regex = "1.11"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"

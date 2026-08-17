@@ -1,0 +1,17 @@
+# ビルド生成物
+target/
+
+# 【重要】AWS の認証情報を含む。絶対にコミットしない（仕様書9章）。
+.env
+.env.local
+
+# Node（第5段階の Svelte）
+node_modules/
+dashboard/.svelte-kit/
+dashboard/build/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+.zed/
