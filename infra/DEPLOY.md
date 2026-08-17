@@ -6,10 +6,16 @@
 実行前に、**何が走るか**を上から順に読めるようにしてあります。危険なもの（課金・削除）には印を付けました。
 
 ```
-所要時間  15〜20分
+所要時間  15〜20分（＋動作確認）
 費用      月 $0.1 未満の見込み（README「AWS の想定月額」参照）
-止め方    このファイルの最後。作業当日に止めます
+止め方    このファイルの最後。★その日のうちに止めます★
 ```
+
+**0番から順に、飛ばさずに実行してください。** 予算アラートを先に置いてあるのは、
+デプロイしてから設定すると、その間に起きた事故に気づけないためです。
+
+**証跡は `infra/evidence/` に保存してください。** 各手順に `> infra/evidence/...` を入れてあります。
+あとから「本当に消したのか」「本当に消せない設定なのか」を確かめられる形にするためです。
 
 ---
 
@@ -229,27 +235,73 @@ curl -s "${URL}api/queue"
 承認は `X-Approver-Id` を付けて。ダッシュボードから触る場合は、
 `dashboard/vite.config.js` の proxy 先をこの URL に変えて `npm run dev`。
 
-**【重要】監査ログが本当に消せないことを、ここで確かめます。**
+### 監査ログが消せないことを、実行せずに証明する
+
+**IAM Policy Simulator を使います。** 実際に消しに行く必要がないので安全で、
+出力をそのまま証跡として残せます。
 
 ```bash
-# 拒否されること（AccessDeniedException が出れば正しい）
-aws dynamodb delete-item --table-name audit_logs \
-  --key '{"pk":{"S":"req-xxxx"},"sk":{"S":"2026-01-01T00:00:00Z#approved"}}'
+ROLE_ARN=arn:aws:iam::$ACCOUNT_ID:role/gate-api-role
+AUDIT_ARN=arn:aws:dynamodb:ap-northeast-1:$ACCOUNT_ID:table/audit_logs
+
+aws iam simulate-principal-policy \
+  --policy-source-arn "$ROLE_ARN" \
+  --action-names dynamodb:DeleteItem dynamodb:UpdateItem dynamodb:BatchWriteItem \
+                 dynamodb:PutItem dynamodb:Query \
+  --resource-arns "$AUDIT_ARN" \
+  | tee infra/evidence/iam-simulate-audit.json \
+  | python3 -c "
+import json, sys
+for r in json.load(sys.stdin)['EvaluationResults']:
+    print(f\"{r['EvalActionName']:<28} {r['EvalDecision']}\")
+"
 ```
 
-このコマンドは**あなたの権限**で走るので、Lambda ロールの Deny は効きません。
-正しく確かめるには、Lambda から delete を呼ぶ経路が無いこと（コードに `delete_item` が
-1つも無いこと）と、ロールのポリシーに Deny が入っていることの両方を見せます。
+**期待する出力はこれです。**
+
+```
+dynamodb:DeleteItem          explicitDeny     ← 消せない
+dynamodb:UpdateItem          explicitDeny     ← 直せない
+dynamodb:BatchWriteItem      explicitDeny     ← まとめても消せない
+dynamodb:PutItem             allowed          ← 追記はできる
+dynamodb:Query               allowed          ← 読める
+```
+
+`explicitDeny` は「Deny が明示的に効いている」という意味です。
+**`BatchWriteItem` をここに含めているのが要点です。** `DeleteItem` だけを拒否しても、
+`BatchWriteItem` の中に `DeleteRequest` を入れれば消せてしまいます。
+
+**面談で「本当に消せないんですか」と聞かれたら、この出力を見せるのがいちばん早い**です。
+
+あわせて、アプリ側にも削除の経路が無いことを残します。
 
 ```bash
-grep -rn "delete_item\|DeleteItem" crates/ || echo "コードに削除の呼び出しはありません"
-aws iam get-role-policy --role-name gate-api-role --policy-name gate-api-policy \
-  --query 'PolicyDocument.Statement[?Effect==`Deny`]'
+grep -rn "delete_item\|DeleteItem" crates/ \
+  > infra/evidence/no-delete-in-code.txt 2>&1 \
+  || echo "コードに削除の呼び出しはありません" > infra/evidence/no-delete-in-code.txt
+cat infra/evidence/no-delete-in-code.txt
 ```
+
+### 動作確認の出力を残す
+
+```bash
+{
+  echo "=== health ==="; curl -s "${URL}api/health"
+  echo; echo "=== policy ==="; curl -s "${URL}api/policy"
+  echo; echo "=== queue ==="; curl -s "${URL}api/queue"
+  echo; echo "=== audit ==="; curl -s "${URL}api/audit"
+} > infra/evidence/aws-run.txt
+```
+
+**スクリーンショット**（ダッシュボードの承認待ち・内訳・シミュレーション）も
+`infra/evidence/` に置いてください。第8段階で README に貼ります。
 
 ---
 
-## 7. 止める（💥 作業当日に実行）
+## 7. 止める（💥 **その日のうちに実行**）
+
+**動作確認 → スクリーンショット → README に反映 → 削除。** 運用はしません。
+ここまで来たら、間を空けずに流してください。
 
 ```bash
 API_ID=$(aws lambda get-function-url-config --function-name gate-api --query FunctionUrl --output text)
@@ -267,10 +319,58 @@ aws logs delete-log-group --log-group-name /aws/lambda/gate-api
 aws iam delete-role-policy --role-name gate-api-role --policy-name gate-api-policy
 aws iam delete-role --role-name gate-api-role
 
-# 消え残りの確認
-aws dynamodb list-tables
-aws logs describe-log-groups --log-group-name-prefix /aws/lambda/gate
-aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `gate`)].FunctionName'
+# 【重要】消え残りの確認。出力を保存する。
+#
+# 「消したつもりで残っている」が、この手のいちばんよくある事故です。
+# 出力があれば、あとから確かめられます。
+{
+  echo "=== 実行日時 ==="; date
+  echo; echo "=== DynamoDB のテーブル（gate 関連が無いこと）==="
+  aws dynamodb list-tables
+  echo; echo "=== ロググループ（空であること）==="
+  aws logs describe-log-groups --log-group-name-prefix /aws/lambda/gate \
+    --query 'logGroups[].logGroupName'
+  echo; echo "=== Lambda 関数（空であること）==="
+  aws lambda list-functions \
+    --query 'Functions[?starts_with(FunctionName, `gate`)].FunctionName'
+  echo; echo "=== IAM ロール（空であること）==="
+  aws iam list-roles --query 'Roles[?starts_with(RoleName, `gate`)].RoleName'
+  echo; echo "=== 予算アラート（残してよい）==="
+  aws budgets describe-budgets --account-id "$ACCOUNT_ID" --query 'Budgets[].BudgetName'
+} > infra/evidence/teardown.txt
+
+cat infra/evidence/teardown.txt
+```
+
+**期待する形はこれです。**
+
+```
+=== DynamoDB のテーブル（gate 関連が無いこと）===
+{ "TableNames": [] }
+=== ロググループ（空であること）===
+[]
+=== Lambda 関数（空であること）===
+[]
+=== IAM ロール（空であること）===
+[]
+=== 予算アラート（残してよい）===
+[ "ai-action-gate" ]
 ```
 
 **予算アラートは残して構いません**（無料）。消し忘れに気づく最後の砦になります。
+
+---
+
+## 実行の記録（チェックリスト）
+
+| | 手順 | 証跡 |
+|---|---|---|
+| ☐ | 0. 予算アラート（ACTUAL 50% ＋ FORECASTED 80%） | `describe-budgets` の出力 |
+| ☐ | 1〜2. ビルド | — |
+| ☐ | 3. DynamoDB 3テーブル ＋ TTL ＋ PITR | — |
+| ☐ | 4. IAM ロール（Deny つき） | — |
+| ☐ | 5. Lambda ＋ **ログ保持7日** | — |
+| ☐ | 6. 動作確認 | `aws-run.txt` |
+| ☐ | 6. **IAM Simulator で Deny を証明** | `iam-simulate-audit.json` |
+| ☐ | 6. スクリーンショット | `*.png` |
+| ☐ | 7. **その日のうちに削除** | `teardown.txt` |
