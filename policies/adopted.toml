@@ -1,0 +1,57 @@
+# 第4段階で採用された設定。
+#
+# 【重要】この値は諏訪が実測を見て選んだものです（仕様書4章）。
+# 変えるときは、gate-lab で分布を測り直してから決めてください。
+#
+#   cargo run -p gate-lab -- weights      重み案の比較（閾値は固定）
+#   cargo run -p gate-lab -- thresholds   閾値案の比較（重みは固定）
+#
+# 重み = 案W2（送信先を重く）。外に出たものは取り返せない、という判断。
+# 閾値 = MEDIUM 20 / HIGH 55。
+#   20: 申告なし（22点）を自動承認しない。書かないほうが通る抜け道を塞ぐ。
+#   55: 社外へ氏名を送る要求にマスキング案を添える。
+#       人手の総数は変わらず、承認者の選択肢が「拒否か承認か」の二択でなくなる。
+#
+# 読ませ方:
+#   GATE_POLICY=policies/adopted.toml cargo run -p gate-api
+
+version = "adopted-v1"
+label = "採用（案W2・20/55）"
+unscanned_floor = "MEDIUM"
+uncertain_name_floor = "MEDIUM"
+
+[thresholds]
+medium_at = 20
+high_at = 55
+
+[weights]
+action = 20
+destination = 40
+data_class = 20
+pii = 20
+
+[points]
+action_read = 10
+action_write = 40
+action_delete = 80
+action_send_external = 70
+destination_internal = 10
+destination_external = 60
+destination_external_ai = 90
+data_public = 0
+data_internal = 30
+data_personal = 80
+data_sensitive = 100
+data_undeclared = 50
+pii_email = 40
+pii_phone = 50
+pii_birth_date = 60
+pii_postal_code = 40
+pii_credit_card = 100
+pii_my_number = 100
+pii_person_name = 60
+
+[confidence_scale]
+high = 100
+medium = 70
+low = 40

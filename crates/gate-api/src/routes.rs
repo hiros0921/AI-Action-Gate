@@ -346,7 +346,7 @@ pub struct PolicyResponse {
 async fn policy(State(state): State<Arc<AppState>>) -> Json<PolicyResponse> {
     let p = state.policy();
     Json(PolicyResponse {
-        adopted: !p.version.starts_with("provisional"),
+        adopted: p.version.starts_with("adopted"),
         version: p.version.clone(),
         label: p.label.clone(),
         thresholds: p.thresholds,

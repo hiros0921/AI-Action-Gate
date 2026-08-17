@@ -650,6 +650,58 @@ mod tests {
     }
 
     #[test]
+    fn 採用値が危険な要求を自動承認しないこと() {
+        // 【重要】第4段階で選ばれた値（案W2・20/55）を、材料に当てて固定する。
+        // 型2（患者情報を外部AIへ）と型4（読めなかった）が1件でも自動承認されたら、
+        // 選定の前提が崩れている。
+        let policy = Policy::adopted();
+        for s in all()
+            .iter()
+            .filter(|s| s.kind.expectation() == Expectation::MustHold)
+        {
+            let scan = detect::scan(&s.request.payload.text, &s.detect);
+            let a = assess(&s.request, &scan, &policy);
+            assert_ne!(
+                a.decision,
+                Decision::Low,
+                "{} が自動承認された（{}点・型{}）",
+                s.id,
+                a.score,
+                s.kind.number()
+            );
+        }
+    }
+
+    #[test]
+    fn 採用値が社内の読み取りを人手に回さないこと() {
+        // 型1が承認待ちに回ると、導入されない。実測でも0件だった。
+        let policy = Policy::adopted();
+        for s in all().iter().filter(|s| s.kind == Kind::InternalRead) {
+            let scan = detect::scan(&s.request.payload.text, &s.detect);
+            let a = assess(&s.request, &scan, &policy);
+            assert_eq!(a.decision, Decision::Low, "{} が人手に回った", s.id);
+        }
+    }
+
+    #[test]
+    fn 採用値では申告なしが自動承認されないこと() {
+        // 諏訪の判断: 「data_class を書かなければ通る」抜け道を塞ぐ。
+        let policy = Policy::adopted();
+        let sample = all()
+            .into_iter()
+            .find(|s| s.id == "S3-i")
+            .expect("申告なしのサンプルが消えている");
+        let scan = detect::scan(&sample.request.payload.text, &sample.detect);
+        let a = assess(&sample.request, &scan, &policy);
+        assert_ne!(
+            a.decision,
+            Decision::Low,
+            "申告なしが自動承認された（{}点）",
+            a.score
+        );
+    }
+
+    #[test]
     fn 実在の個人情報を含まないこと() {
         // 仕様書9章。メールは RFC 2606 の予約ドメインだけ。
         for s in all() {

@@ -53,8 +53,10 @@ async fn main() {
             }
         },
         Err(_) => {
-            tracing::warn!("暫定の設定で動いています（第4段階で採用値に差し替えます）");
-            Policy::provisional()
+            // 第4段階で確定した採用値。設定ファイルを渡さなければこれで動く。
+            let p = Policy::adopted();
+            tracing::info!("採用値で動いています（{}・{}）", p.version, p.label);
+            p
         }
     };
 
