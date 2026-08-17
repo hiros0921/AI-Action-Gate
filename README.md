@@ -304,6 +304,122 @@ cargo run -p gate-lab -- thresholds   # 閾値案の比較（重みは固定）
 
 ---
 
+## AWS の想定月額（第7段階のデプロイ前）
+
+### 前提
+
+**前提なしの金額は意味がないので、先に書きます。**
+
+| 前提 | 値 | 備考 |
+|---|---|---|
+| 実行要求 | **30件/日** | デモと動作確認。実運用ではない |
+| 承認者 | **1人** | |
+| ダッシュボードを開いている時間 | **1日8時間 × 月20日** | **ここが効きます** |
+| ポーリング間隔 | **3秒**（`GATE_POLL_MS`） | |
+| リージョン | ap-northeast-1（東京） | |
+| 保存されている要求 | 50件 | 読み取り費用がここに比例します |
+
+### 費用は「要求の件数」では決まりません
+
+3秒間隔で画面を開いたままにすると、**1時間で1,200リクエスト**。8時間で9,600、月20日で
+**192,000リクエスト**です。承認待ちが1日3件でも、この数字は変わりません。
+
+**費用を決めるのは「画面を開いている時間 × 保存件数」です。**
+
+| 内訳 | 月あたりのリクエスト |
+|---|---|
+| ダッシュボードのポーリング（承認待ちタブ） | 192,000 |
+| 疑似エージェント（要求30件/日 ＋ 結果の取得） | 約 5,000 |
+| **合計** | **約 197,000** |
+| （参考）履歴・監査タブを開いたままにすると | 約 581,000 |
+
+最後の行は、いまの画面が承認待ち以外のタブでは3つのAPIを叩くためです。
+
+### サービスごと
+
+| サービス | 数量 | 12ヶ月以内 | 13ヶ月目以降 |
+|---|---|---|---|
+| **Lambda** | 197,000回 × 30ms × 128MB ＝ 約740 GB秒 | **$0**（常時無料: 100万回・40万GB秒） | $0 |
+| **API Gateway**（HTTP API） | 197,000リクエスト | **$0**（**12ヶ月無料**: 100万/月） | **約 $0.24** |
+| **DynamoDB** 書き込み | 約5,400 WRU | 約 $0.01 | 約 $0.01 |
+| **DynamoDB** 読み取り | 約 605万 RRU | **約 $1.72** | 約 $1.72 |
+| **DynamoDB** 保存 | 1MB未満 | $0（25GBまで常時無料） | $0 |
+| **CloudWatch Logs** | 約 59MB | $0（5GBまで常時無料） | $0 |
+| **データ転送** | 約 0.4GB | $0（100GB/月まで無料） | $0 |
+| **合計** | | **約 $1.8/月** | **約 $2.0/月** |
+
+**無料枠は2種類あります。** Lambda と DynamoDB と CloudWatch は**常時無料**の枠ですが、
+**API Gateway は12ヶ月無料**です。1年後に課金が始まります（上表の右列）。
+
+DynamoDB のオンデマンドには注意があります。**無料枠の「25 WCU / 25 RCU」はプロビジョンドモード専用**で、
+オンデマンドには適用されません。1リクエスト目から課金されます（金額は上表のとおり小さい）。
+
+### 主役は DynamoDB の読み取りです
+
+ポーリング1回ごとに、承認待ちを取るために `action_requests` を **Scan** し、
+件数ぶん `request_payloads` を **GetItem** しています。**保存件数に比例して増えます。**
+
+| 保存件数 | 1回あたり | 月額（読み取り） |
+|---|---|---|
+| 20件 | 約13 RRU | 約 $0.7 |
+| 50件 | 約32 RRU | **約 $1.7** |
+| 100件 | 約63 RRU | 約 $3.4 |
+| 500件 | 約313 RRU | 約 $17 |
+
+ETag で 304 を返す道でも、**変わっていないことを確かめるために同じ Scan をしています。**
+本文の生成は止まりますが、読み取り費用は止まりません。
+
+### 最悪のケース
+
+履歴タブを開いたまま、保存が100件まで増えた場合: 読み取り 約$10 ＋ API Gateway $0.71 ＝ **約 $11/月**。
+
+### CloudWatch Logs の保持期間
+
+**既定は「無期限」です。** 設定しないとログが溜まり続け、静かに課金されます。
+**7日**を明示的に設定します（デプロイ手順に含めます）。
+
+```bash
+aws logs put-retention-policy --log-group-name /aws/lambda/gate-api --retention-in-days 7
+```
+
+---
+
+## 止め方（デプロイしたあと）
+
+**このプロジェクトは実績づくりで、運用しません。** 動作確認とスクリーンショットが済んだら止めます。
+
+消し忘れると課金が続くものを、順に消します。
+
+```bash
+# ① API Gateway（12ヶ月を過ぎるとリクエスト課金）
+aws apigatewayv2 delete-api --api-id <API_ID>
+
+# ② Lambda 関数
+aws lambda delete-function --function-name gate-api
+
+# ③ DynamoDB の3テーブル（保存が課金対象。25GBまでは無料だが、消し忘れない）
+aws dynamodb delete-table --table-name action_requests
+aws dynamodb delete-table --table-name request_payloads
+aws dynamodb delete-table --table-name audit_logs
+
+# ④ CloudWatch Logs のロググループ
+#    【重要】Lambda を消してもロググループは残ります。ここが消し忘れの定番。
+aws logs delete-log-group --log-group-name /aws/lambda/gate-api
+
+# ⑤ IAM ロールとポリシー（課金はされないが、残すと権限が残る）
+aws iam delete-role-policy --role-name gate-api-role --policy-name gate-api-policy
+aws iam delete-role --role-name gate-api-role
+
+# ⑥ 消え残りがないか確認
+aws dynamodb list-tables
+aws logs describe-log-groups --log-group-name-prefix /aws/lambda/gate
+aws apigatewayv2 get-apis --query 'Items[].Name'
+```
+
+**AWS Budgets のアラートは残して構いません**（無料）。消し忘れに気づく最後の砦になります。
+
+---
+
 ## 構成
 
 ```
