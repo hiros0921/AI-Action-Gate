@@ -123,6 +123,25 @@ pub struct Policy {
     /// 【重要】走査していない本文を LOW で自動承認しないための下限です。
     /// 「PIIが見つからなかった」と「見ていない」を分けた意味が、ここで効きます。
     pub unscanned_floor: Decision,
+    /// 確証のない氏名を含む要求を、最低でもここまで上げる。
+    ///
+    /// <div class="warning">
+    ///
+    /// 【重要】諏訪の指示（第4段階）:
+    ///
+    /// > 辞書外の姓＋様が Medium に落ちるのは構いません。ただし LOW には落とさないでください。
+    /// > 「氏名かもしれないが確証がない」は、「氏名がない」とは違います。
+    /// > 人に見せる側に倒してください。
+    ///
+    /// `unscanned_floor` と同じ形です。確信度が High でない氏名は、
+    /// 点数がいくら低くても自動承認しません。
+    ///
+    /// <b>Low（形が似ているだけ）にも同じ扱いを当てています。</b>
+    /// Medium より確証が弱いものを自動承認して、Medium だけ止めるのは筋が通らないためです。
+    /// Medium だけに限る形が良ければ、そう直します。
+    ///
+    /// </div>
+    pub uncertain_name_floor: Decision,
 }
 
 /// 三分岐の結果。
@@ -198,6 +217,7 @@ impl Policy {
                 low: 40,
             },
             unscanned_floor: Decision::Medium,
+            uncertain_name_floor: Decision::Medium,
         }
     }
 

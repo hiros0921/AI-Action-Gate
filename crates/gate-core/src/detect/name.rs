@@ -53,6 +53,33 @@ static HONORIFIC: LazyLock<Regex> = LazyLock::new(|| {
 /// 熟語を作りうる漢字の敬称。
 const KANJI_HONORIFICS: [&str; 3] = ["様", "氏", "殿"];
 
+/// 敬称の字で終わる普通名詞の語尾。
+///
+/// <div class="warning">
+///
+/// 【重要】ここだけは「語を並べる方式」を採っています。役割語（〜者・〜員）で
+/// 語尾の規則にしたのと、判断が違います。理由は<b>閉じた集合だから</b>です。
+///
+/// 姓は増え続けますし、役割語も「〜担当者」「〜責任者」といくらでも作れます。
+/// 一方、様・氏・殿で終わる<b>普通名詞</b>は、これ以上ほとんど増えません。
+/// 仕様・模様・同様——辞書に載っている語であって、誰かが新しく作る語ではない。
+///
+/// </div>
+const COMPOUND_TAILS: &[&str] = &[
+    "仕様", "模様", "同様", "多様", "一様", "異様", "態様", "王様", "神様", "殿様", "奥様", "皆様",
+    "何様", "華氏", "摂氏", "姓氏", "御殿", "神殿", "宮殿", "本殿", "拝殿", "貴殿",
+];
+
+/// 敬称と、その直前の1字が普通名詞を作っていないか。
+///
+/// 「製品仕様」なら、末尾の「仕」＋「様」で "仕様"。
+fn forms_compound(name: &str, honorific: &str) -> bool {
+    match name.chars().next_back() {
+        Some(last) => COMPOUND_TAILS.contains(&format!("{last}{honorific}").as_str()),
+        None => false,
+    }
+}
+
 /// ラベルつき。`氏名：山田太郎` の形。
 static LABELED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -248,25 +275,30 @@ pub fn detect(text: &str) -> Vec<Finding> {
         if is_role_word(name.as_str()) {
             continue;
         }
-        // 漢字の敬称は熟語を作る。姓の辞書で裏を取れないものは言い切らない。
+        // 漢字の敬称は熟語を作る。「製品仕様」の「仕」＋「様」がその例。
         let kanji_honorific = KANJI_HONORIFICS.contains(&honorific);
-        let looks_like_kanji_name = name.as_str().chars().all(|c| !c.is_ascii())
-            && SURNAMES.iter().any(|s| name.as_str().starts_with(s));
-        let katakana = name
-            .as_str()
-            .chars()
-            .all(|c| matches!(c, 'ァ'..='ヶ' | 'ー'));
-        if kanji_honorific && !katakana && !looks_like_kanji_name {
+        if kanji_honorific && forms_compound(name.as_str(), honorific) {
+            // 普通名詞。氏名ではない。
             continue;
         }
+
+        // 【重要】辞書に無い姓＋様を、ここで捨てないこと（諏訪の指示・第4段階）:
+        //
+        //   > 「氏名かもしれないが確証がない」は、「氏名がない」とは違います。
+        //   > 人に見せる側に倒してください。
+        //
+        // 捨てると「氏名がない」と同じ扱いになり、第2段階で「0件」と「見ていない」を
+        // 型で分けた意味が、ここで崩れます。確信度を下げて残す。
+        // 自動承認させない扱いは score 側（uncertain_name_floor）が受け持ちます。
+        let in_dictionary = SURNAMES.iter().any(|s| name.as_str().starts_with(s));
+        let confidence = if !kanji_honorific || in_dictionary {
+            Confidence::High
+        } else {
+            Confidence::Medium
+        };
         found.push(
-            Finding::new(
-                PiiKind::PersonName,
-                name.start(),
-                name.end(),
-                Confidence::High,
-            )
-            .with(Evidence::Honorific(honorific.to_string())),
+            Finding::new(PiiKind::PersonName, name.start(), name.end(), confidence)
+                .with(Evidence::Honorific(honorific.to_string())),
         );
     }
 
@@ -385,6 +417,22 @@ mod tests {
                 !found.iter().any(|f| f.confidence == Confidence::High),
                 "{text} で氏名を言い切っている: {found:?}"
             );
+        }
+    }
+
+    #[test]
+    fn 辞書に無い姓でも捨てないこと() {
+        // 【重要】諏訪の指示（第4段階）:
+        //   「辞書外の姓＋様が Medium に落ちるのは構いません。
+        //     ただし LOW には落とさないでください」
+        // 捨てると「氏名がない」と同じになる。確信度を下げて残す。
+        for text in ["新垣様よりご連絡がありました", "五十嵐様の件です"] {
+            let found = detect(text);
+            let name = found
+                .iter()
+                .find(|f| f.kind == PiiKind::PersonName)
+                .unwrap_or_else(|| panic!("{text} で氏名が消えている"));
+            assert_eq!(name.confidence, Confidence::Medium, "{text}");
         }
     }
 

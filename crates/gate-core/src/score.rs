@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::action::ActionRequest;
-use crate::detect::{KindCount, PiiKind, Scan};
+use crate::detect::{Confidence, KindCount, PiiKind, Scan};
 use crate::policy::{Decision, Policy, Thresholds};
 
 /// スコアに効いた要素。
@@ -89,7 +89,12 @@ pub struct RiskAssessment {
     pub clamped: bool,
     /// 走査を終えているか。false なら「PIIは無かった」と言えない。
     pub conclusive: bool,
-    /// 走査していないために引き上げたか。
+    /// 確証のない氏名（確信度が High でない）を含むか。
+    ///
+    /// 【重要】再判定（[`redecide`]）でも同じ扱いをするために、結果に持たせています。
+    /// scan を捨てたあとでも「確証がなかった」ことが分かる必要があります。
+    pub uncertain_name: bool,
+    /// 走査していない、または確証のない氏名を含むために引き上げたか。
     pub raised_by_uncertainty: bool,
     /// 種別と件数のみ。**平文は入っていない**（仕様書5章・7章）。
     pub detected: Vec<KindCount>,
@@ -182,11 +187,14 @@ pub fn assess(request: &ActionRequest, scan: &Scan, policy: &Policy) -> RiskAsse
     // 分けていなければ、読めなかった本文が0件として LOW で自動承認されます。
     let by_score = policy.decide(score);
     let conclusive = scan.is_conclusive();
-    let decision = if conclusive {
-        by_score
-    } else {
-        by_score.max(policy.unscanned_floor)
-    };
+
+    // 確証のない氏名も同じ扱い。「氏名かもしれない」は「氏名がない」ではない。
+    let uncertain_name = scan
+        .findings()
+        .iter()
+        .any(|f| f.kind == PiiKind::PersonName && f.confidence != Confidence::High);
+
+    let decision = floor(by_score, conclusive, uncertain_name, policy);
 
     RiskAssessment {
         score,
@@ -197,9 +205,25 @@ pub fn assess(request: &ActionRequest, scan: &Scan, policy: &Policy) -> RiskAsse
         raw_total,
         clamped,
         conclusive,
+        uncertain_name,
         raised_by_uncertainty: decision != by_score,
         detected: scan.summary(),
     }
+}
+
+/// 確証が足りないぶんを引き上げる。
+///
+/// 【重要】判定と再判定で同じ規則を使うため、1か所に置いてあります。
+/// 2か所に書くと、片方だけ直したときに画面と実際が食い違います。
+fn floor(by_score: Decision, conclusive: bool, uncertain_name: bool, policy: &Policy) -> Decision {
+    let mut decision = by_score;
+    if !conclusive {
+        decision = decision.max(policy.unscanned_floor);
+    }
+    if uncertain_name {
+        decision = decision.max(policy.uncertain_name_floor);
+    }
+    decision
 }
 
 /// 素点 × 重み ÷ 100。
@@ -227,7 +251,7 @@ fn highest_confidence(scan: &Scan, kind: PiiKind) -> crate::detect::Confidence {
 /// 個人情報を持ち続けなくてよい、という設計上の利点がここに出ます。
 ///
 /// </div>
-pub fn redecide(assessment: &RiskAssessment, thresholds: Thresholds, floor: Decision) -> Decision {
+pub fn redecide(assessment: &RiskAssessment, thresholds: Thresholds, policy: &Policy) -> Decision {
     let by_score = if assessment.score < thresholds.medium_at {
         Decision::Low
     } else if assessment.score < thresholds.high_at {
@@ -235,11 +259,13 @@ pub fn redecide(assessment: &RiskAssessment, thresholds: Thresholds, floor: Deci
     } else {
         Decision::High
     };
-    if assessment.conclusive {
-        by_score
-    } else {
-        by_score.max(floor)
-    }
+    // 判定時と同じ規則を通す。緩めても、確証が無いものは人手に残る。
+    floor(
+        by_score,
+        assessment.conclusive,
+        assessment.uncertain_name,
+        policy,
+    )
 }
 
 /// 重みを変えた場合の点を、内訳から計算し直す（仕様書3章）。
@@ -453,8 +479,9 @@ mod tests {
         let strict = Thresholds::new(10, 20).unwrap();
         let loose = Thresholds::new(90, 95).unwrap();
 
-        assert_eq!(redecide(&a, strict, Decision::Medium), Decision::High);
-        assert_eq!(redecide(&a, loose, Decision::Medium), Decision::Low);
+        let policy = Policy::provisional();
+        assert_eq!(redecide(&a, strict, &policy), Decision::High);
+        assert_eq!(redecide(&a, loose, &policy), Decision::Low);
     }
 
     #[test]
@@ -474,7 +501,60 @@ mod tests {
         );
         // どれだけ緩めても LOW にしてはいけない。
         let very_loose = Thresholds::new(99, 100).unwrap();
-        assert_ne!(redecide(&a, very_loose, Decision::Medium), Decision::Low);
+        assert_ne!(
+            redecide(&a, very_loose, &Policy::provisional()),
+            Decision::Low
+        );
+    }
+
+    #[test]
+    fn 確証のない氏名を自動承認しないこと() {
+        // 【重要】諏訪の指示（第4段階）:
+        //   「Medium に落ちた場合に自動承認されないことを、テストで固定してください」
+        //
+        // 「新垣」は姓の辞書に無いので、敬称付きでも確信度は Medium。
+        // 点数そのものは低いが、それでも人手に回す。
+        let a = assess_text(
+            ActionKind::Read,
+            Destination::Internal,
+            DataClass::Public,
+            "新垣様よりお問い合わせがありました",
+        );
+
+        assert!(a.uncertain_name, "確証のない氏名として記録されていない");
+        assert!(a.score < a.thresholds.medium_at, "点数そのものは低いはず");
+        assert_ne!(a.decision, Decision::Low, "点が低いからと自動承認している");
+        assert!(a.raised_by_uncertainty);
+    }
+
+    #[test]
+    fn 確証のない氏名はシミュレーションでも自動承認にならないこと() {
+        // 閾値をどれだけ緩めても、確証が無いものは人手に残る。
+        let a = assess_text(
+            ActionKind::Read,
+            Destination::Internal,
+            DataClass::Public,
+            "新垣様よりお問い合わせがありました",
+        );
+        let very_loose = Thresholds::new(99, 100).unwrap();
+        assert_ne!(
+            redecide(&a, very_loose, &Policy::provisional()),
+            Decision::Low
+        );
+    }
+
+    #[test]
+    fn 確証のある氏名は点数どおりに扱うこと() {
+        // 下限が常に効いてしまうと、閾値を動かす意味が無くなる。
+        // 辞書にある姓＋敬称は High なので、引き上げの対象外。
+        let a = assess_text(
+            ActionKind::Read,
+            Destination::Internal,
+            DataClass::Public,
+            "田中様よりお問い合わせがありました",
+        );
+        assert!(!a.uncertain_name);
+        assert!(!a.raised_by_uncertainty);
     }
 
     #[test]

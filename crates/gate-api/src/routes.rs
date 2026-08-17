@@ -415,8 +415,8 @@ async fn simulate(
     for r in &requests {
         let a: &RiskAssessment = &r.assessment;
         // 【重要】本文は読み直しません。保存済みの内訳だけで再判定します。
-        let before = score::redecide(a, a.thresholds, policy.unscanned_floor);
-        let after = score::redecide(a, thresholds, policy.unscanned_floor);
+        let before = score::redecide(a, a.thresholds, &policy);
+        let after = score::redecide(a, thresholds, &policy);
         count_into(&mut current, before);
         count_into(&mut proposed, after);
         if before.needs_human() && !after.needs_human() {

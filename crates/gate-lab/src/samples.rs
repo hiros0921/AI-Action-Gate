@@ -340,7 +340,18 @@ pub fn all() -> Vec<Sample> {
             ),
         ),
         unscannable(
-            "S4-b",
+            "S4-b-mid",
+            "上限を超える本文。外部AIへの読み取りで、点は中間帯",
+            req(
+                "agent-007",
+                Read,
+                ExternalAi,
+                DataClass::Internal,
+                &"取り込んだ社内資料のテキストが続きます。".repeat(40),
+            ),
+        ),
+        unscannable(
+            "S4-c",
             "上限を超える本文。外部AIへ",
             req(
                 "agent-007",
@@ -539,6 +550,30 @@ mod tests {
         let min = *scores.iter().min().unwrap();
         let max = *scores.iter().max().unwrap();
         assert!(max - min >= 20, "境目が1点に固まっている（{min}〜{max}）");
+    }
+
+    #[test]
+    fn 型4が低中高に散っていること() {
+        // 【重要】諏訪の指示（第4段階）:
+        //   「点が低くても必ず承認待ち」を守る、いちばん重要な型。
+        //   両端だけだと、点の高さで挙動が変わったときに気づけない。
+        let policy = Policy::provisional();
+        let scores: Vec<u8> = all()
+            .iter()
+            .filter(|s| s.kind == Kind::Unscannable)
+            .map(|s| {
+                let scan = detect::scan(&s.request.payload.text, &s.detect);
+                assess(&s.request, &scan, &policy).score
+            })
+            .collect();
+
+        assert!(scores.len() >= 3, "型4が {} 件しかない", scores.len());
+        assert!(scores.iter().any(|&s| s < 20), "低い側が無い: {scores:?}");
+        assert!(
+            scores.iter().any(|&s| (30..=40).contains(&s)),
+            "中間帯（30〜40）が無い: {scores:?}"
+        );
+        assert!(scores.iter().any(|&s| s > 45), "高い側が無い: {scores:?}");
     }
 
     #[test]
