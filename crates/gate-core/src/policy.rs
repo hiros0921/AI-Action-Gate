@@ -78,7 +78,7 @@ pub struct Points {
 }
 
 /// 重み。要素ごとに、素点をどれだけ効かせるか。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Weights {
     pub action: u8,
     pub destination: u8,

@@ -30,12 +30,15 @@ enum Command {
     Samples,
     /// 重み案の比較（閾値は固定）。
     Weights,
+    /// 閾値案の比較（重みは採用済みの案W2に固定）。
+    Thresholds,
 }
 
 fn main() {
     match Cli::parse().command {
         Command::Samples => list_samples(),
         Command::Weights => compare_weights(),
+        Command::Thresholds => compare_thresholds(),
     }
 }
 
@@ -398,4 +401,157 @@ fn truncate(s: &str, width: usize) -> String {
 
 fn line() {
     println!("{}", "=".repeat(108));
+}
+
+fn compare_thresholds() {
+    let all = samples::all();
+    let proposals = proposals::threshold_proposals();
+    let w = proposals::ADOPTED_WEIGHTS;
+
+    line();
+    println!("  閾値案の比較（{}件のサンプル）", all.len());
+    println!(
+        "  【重要】重みは採用済みの案W2に固定してあります（操作{} 送信先{} 区分{} PII{}）",
+        w.action, w.destination, w.data_class, w.pii
+    );
+    println!("  諏訪の申し送り: 13〜25の範囲を優先。初期値は安全側でよい");
+    line();
+    for p in &proposals {
+        println!(
+            "  案{}・{:<12} MEDIUM {:>3}以上 / HIGH {:>3}以上{}",
+            p.id,
+            p.label,
+            p.thresholds.medium_at,
+            p.thresholds.high_at,
+            if (13..=25).contains(&p.thresholds.medium_at) {
+                ""
+            } else {
+                "   ← 推奨範囲の外"
+            }
+        );
+        println!("      {}", p.stance);
+    }
+
+    let reports: Vec<(&proposals::ThresholdProposal, Report)> = proposals
+        .iter()
+        .map(|p| (p, evaluate(&all, &p.policy())))
+        .collect();
+
+    line();
+    println!("  ① 危険な要求（型2・型4）が自動承認された件数 ← 必ず0であること");
+    line();
+    for (p, r) in &reports {
+        println!(
+            "  案{}  {:>2}件  {}",
+            p.id,
+            r.dangerous_auto.len(),
+            if r.dangerous_auto.is_empty() {
+                "✓".to_string()
+            } else {
+                format!("✗ {}", r.dangerous_auto.join("・"))
+            }
+        );
+    }
+
+    line();
+    println!("  ② 安全な要求（型1）が承認待ちに回った件数 ← 少ないほうが良い");
+    println!("  ③ 承認待ちの総件数（{}件中）", all.len());
+    line();
+    println!(
+        "  {:<6} {:>10} {:>12} {:>10} {:>12}",
+        "案", "型1が回った", "承認待ち総数", "人手の割合", "うちHIGH"
+    );
+    for (p, r) in &reports {
+        let high: usize = r.decisions.iter().map(|(_, _, _, h)| h).sum();
+        println!(
+            "  案{:<5} {:>10} {:>12} {:>9}% {:>12}",
+            p.id,
+            format!("{}件", r.safe_held.len()),
+            format!("{}件", r.held_total),
+            (r.held_total * 100).div_ceil(all.len()),
+            format!("{high}件"),
+        );
+    }
+
+    line();
+    println!("  ④ 型ごとの判定内訳（LOW-MED-HIGH）。点数は重みが同じなので全案共通");
+    line();
+    print!("  {:<24}{:>6}", "型", "点");
+    for (p, _) in &reports {
+        print!("{:>10}", format!("案{}", p.id));
+    }
+    println!();
+    for (i, (kind, min, mid, max)) in reports[0].1.spread.iter().enumerate() {
+        print!(
+            "  型{} {:<20}{:>6}",
+            kind.number(),
+            kind.label(),
+            format!("{min}/{mid}/{max}")
+        );
+        for (_, r) in &reports {
+            let (_, low, med, high) = r.decisions[i];
+            print!("{:>10}", format!("{low}-{med}-{high}"));
+        }
+        println!();
+    }
+
+    line();
+    println!("  ⑤ 案によって判定が変わった要求");
+    line();
+    for s in all
+        .iter()
+        .filter(|s| s.kind.expectation() != Expectation::MustHold)
+    {
+        let mut cells = Vec::new();
+        let mut first: Option<Decision> = None;
+        let mut differs = false;
+        let mut score = 0;
+        for (p, _) in &reports {
+            let scan = detect::scan(&s.request.payload.text, &s.detect);
+            let a = assess(&s.request, &scan, &p.policy());
+            score = a.score;
+            match first {
+                None => first = Some(a.decision),
+                Some(d) if d != a.decision => differs = true,
+                _ => {}
+            }
+            cells.push(format!("{:?}", a.decision));
+        }
+        if !differs {
+            continue;
+        }
+        print!("  {:<10}{:>4}点  ", s.id, score);
+        for c in cells {
+            print!("{c:<9}");
+        }
+        println!("{}", s.note);
+    }
+
+    line();
+    println!("  ⑥ 25 から 40 へ緩めたら何が自動に落ちるか（諏訪の申し送り）");
+    println!("  これは画面のシミュレーションで見せる形そのものです");
+    line();
+    let strict = proposals.iter().find(|p| p.id == "T3").unwrap().policy();
+    let loose = proposals.iter().find(|p| p.id == "T4").unwrap().policy();
+    let mut moved = Vec::new();
+    for s in &all {
+        let scan = detect::scan(&s.request.payload.text, &s.detect);
+        let before = assess(&s.request, &scan, &strict);
+        let after = assess(&s.request, &scan, &loose);
+        if before.decision.needs_human() && !after.decision.needs_human() {
+            moved.push((s, before.score, !after.detected.is_empty()));
+        }
+    }
+    println!("  自動承認へ移るのは {}件", moved.len());
+    for (s, score, with_pii) in &moved {
+        println!(
+            "    {:<10}{:>4}点  型{}  {}{}",
+            s.id,
+            score,
+            s.kind.number(),
+            s.note,
+            if *with_pii { "   ← PIIを含む" } else { "" }
+        );
+    }
+    line();
 }

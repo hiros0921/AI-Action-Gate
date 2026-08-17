@@ -100,3 +100,110 @@ impl WeightProposal {
         }
     }
 }
+
+// ══════════════════════════════════════════════════════════════════
+//  閾値案（重みは案W2に固定）
+// ══════════════════════════════════════════════════════════════════
+
+/// 閾値案を比べるあいだ固定する重み。**案W2が採用されました。**
+///
+/// <div class="warning">
+///
+/// 諏訪の判断（第4段階）:
+///
+/// > ① 事故の不可逆性が違う。社内の削除はバックアップで戻せる可能性があるが、
+/// >   外部AIに渡った情報は取り返せない。型5を見ると、W2だけが1件も自動承認していない。
+/// >   「PIIが検出されなかったから通す」は、「検出できなかった」と「無かった」の
+/// >   区別と方向が逆。
+/// > ② W3・W4は社内の正常業務をHIGHに上げる。決済処理でカード番号をマスクしたら
+/// >   業務が止まる。承認画面が正常業務で埋まる。
+/// > ③ W2の弱点（社内削除が26点で自動承認）は閾値で直せる。あとから直せる余地が
+/// >   W2は大きい。これが決定打。
+///
+/// </div>
+pub const ADOPTED_WEIGHTS: Weights = Weights {
+    action: 20,
+    destination: 40,
+    data_class: 20,
+    pii: 20,
+};
+
+/// 閾値の案。
+pub struct ThresholdProposal {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub stance: &'static str,
+    pub thresholds: Thresholds,
+}
+
+/// 閾値案。重みは [`ADOPTED_WEIGHTS`] に固定。
+///
+/// 【重要】諏訪の申し送り（第4段階）:
+///
+/// > 13〜25の範囲を優先して検討してください。ここなら、社内削除も外部送信も守られます。
+/// > 人手は増えますが、このシステムの主張は「安全側から始めて、緩め方を数字で見せる」こと。
+/// > 初期値は安全側でいいと思います。
+///
+/// T1〜T3 がその範囲。T4 は範囲の外に置いた比較用で、
+/// 「緩めると何件が自動に落ちるか」を数字で見るためのものです。
+pub fn threshold_proposals() -> Vec<ThresholdProposal> {
+    vec![
+        ThresholdProposal {
+            id: "T1",
+            label: "帯の下端",
+            stance: "型1（社内のread・最大12点）のすぐ上で切る。いちばん安全側",
+            thresholds: Thresholds {
+                medium_at: 13,
+                high_at: 70,
+            },
+        },
+        ThresholdProposal {
+            id: "T2",
+            label: "帯の中央",
+            stance: "13〜25の真ん中。社内の軽い操作に少しだけ余地を残す",
+            thresholds: Thresholds {
+                medium_at: 20,
+                high_at: 70,
+            },
+        },
+        ThresholdProposal {
+            id: "T3",
+            label: "帯の上端",
+            stance: "社内の削除（26点）の直前まで緩める。範囲内でいちばん人手が少ない",
+            thresholds: Thresholds {
+                medium_at: 25,
+                high_at: 70,
+            },
+        },
+        ThresholdProposal {
+            id: "T4",
+            label: "帯の外（比較用）",
+            stance: "推奨範囲の外。緩めると何が自動に落ちるかを見るための対照",
+            thresholds: Thresholds {
+                medium_at: 40,
+                high_at: 70,
+            },
+        },
+        ThresholdProposal {
+            id: "T5",
+            label: "HIGHを広げる",
+            stance: "境目は上端のまま、マスキング案を添える範囲を広げる",
+            thresholds: Thresholds {
+                medium_at: 25,
+                high_at: 55,
+            },
+        },
+    ]
+}
+
+impl ThresholdProposal {
+    pub fn policy(&self) -> Policy {
+        Policy {
+            version: format!("threshold-{}", self.id.to_lowercase()),
+            label: format!("案{}・{}", self.id, self.label),
+            thresholds: self.thresholds,
+            weights: ADOPTED_WEIGHTS,
+            ..Policy::provisional()
+        }
+    }
+}

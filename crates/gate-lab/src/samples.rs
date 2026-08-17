@@ -327,6 +327,50 @@ pub fn all() -> Vec<Sample> {
                 "担当変更の連絡です。後任は山田太郎が務めます。",
             ),
         ),
+        // 【重要】ここから3件は、閾値案の比較に入ってから足しました。
+        //
+        // 案W2 を固定して閾値を比べたところ、T1(13) / T2(20) / T3(25) の結果が
+        // 完全に一致しました。推奨帯 13〜25 に落ちるサンプルが1件も無かったためです
+        // （型1の最大が12点、次に低いのが社内削除の26点）。
+        //
+        // 材料に無い帯では、案の差が測れません。型3を最も厚くしたのと同じ理由で、
+        // 判断が必要な帯には材料が要ります。
+        sample(
+            "S3-i",
+            Kind::Borderline,
+            "社内で書き込み。データ区分の申告なし",
+            req(
+                "agent-011",
+                Write,
+                Destination::Internal,
+                Undeclared,
+                "作業メモを社内の共有ドライブへ書き込みます。",
+            ),
+        ),
+        sample(
+            "S3-j",
+            Kind::Borderline,
+            "社内で書き込み。社内限り",
+            req(
+                "agent-011",
+                Write,
+                Destination::Internal,
+                DataClass::Internal,
+                "月次の集計結果を社内ダッシュボードへ反映します。",
+            ),
+        ),
+        sample(
+            "S3-k",
+            Kind::Borderline,
+            "社内の read。区分は個人情報だが本文にPIIなし",
+            req(
+                "agent-012",
+                Read,
+                Destination::Internal,
+                PersonalInformation,
+                "顧客台帳の件数だけを集計します。個々の項目は取り出しません。",
+            ),
+        ),
         // ── 型4: 読めなかった。点が低くても必ず承認待ち ──────────
         unscannable(
             "S4-a",
