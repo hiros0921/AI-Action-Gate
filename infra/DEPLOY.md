@@ -329,6 +329,30 @@ cat infra/evidence/no-delete-in-code.txt
 **スクリーンショット**（ダッシュボードの承認待ち・内訳・シミュレーション）も
 `infra/evidence/` に置いてください。第8段階で README に貼ります。
 
+### 証跡を伏せる（🔒 **git add より前に**）
+
+証跡には **Function URL** と、ARN に含まれる **12桁の AWS アカウントID** が入ります。
+どちらも秘密情報ではありませんが、公開リポジトリに置く必要もありません。
+**コミットしてしまうと、あとから消しても履歴には残ります。**
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+URL_HOST=$(echo "$URL" | sed -E 's#https?://([^/]+)/?.*#\1#')
+
+cd infra/evidence
+for f in *.json *.txt; do
+  [ -f "$f" ] || continue
+  sed -i '' -e "s/$ACCOUNT_ID/<ACCOUNT_ID>/g" -e "s/$URL_HOST/<FUNCTION_URL>/g" "$f"
+done
+
+# 残っていないことを確かめてから git add する
+grep -rn "$ACCOUNT_ID" . && echo "!! アカウントIDが残っています" || echo "アカウントID: なし"
+grep -rn "$URL_HOST"    . && echo "!! URL が残っています"          || echo "URL: なし"
+cd ../..
+```
+
+**スクリーンショットは手で伏せてください。** アドレスバーとヘッダに URL が写ります。
+
 ---
 
 ## 7. 止める（💥 **その日のうちに実行**）
