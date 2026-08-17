@@ -9,12 +9,13 @@
 
 use clap::{Parser, Subcommand};
 use gate_core::detect;
-use gate_core::policy::Policy;
+use gate_core::policy::{Decision, Policy};
 use gate_core::score::assess;
 
+mod proposals;
 mod samples;
 
-use samples::{Expectation, Kind};
+use samples::{Expectation, Kind, Sample};
 
 #[derive(Parser)]
 #[command(name = "gate-lab", about = "スコアリング案を実測で比べる")]
@@ -27,12 +28,247 @@ struct Cli {
 enum Command {
     /// 比較に使うサンプル要求の一覧。
     Samples,
+    /// 重み案の比較（閾値は固定）。
+    Weights,
 }
 
 fn main() {
     match Cli::parse().command {
         Command::Samples => list_samples(),
+        Command::Weights => compare_weights(),
     }
+}
+
+/// 案1つぶんの成績。
+struct Report {
+    /// 【最優先】危険な要求（型2・型4）が自動承認された件数。0でなければ不採用。
+    dangerous_auto: Vec<String>,
+    /// 安全な要求（型1）が承認待ちに回った件数。少ないほうが良い。
+    safe_held: Vec<String>,
+    /// 承認待ちの総件数。
+    held_total: usize,
+    /// 型ごとの点数分布。
+    spread: Vec<(Kind, u8, u8, u8)>,
+    /// 型ごとの判定内訳。
+    decisions: Vec<(Kind, usize, usize, usize)>,
+}
+
+fn evaluate(all: &[Sample], policy: &Policy) -> Report {
+    let mut dangerous_auto = Vec::new();
+    let mut safe_held = Vec::new();
+    let mut held_total = 0;
+    let mut spread = Vec::new();
+    let mut decisions = Vec::new();
+
+    let mut kinds: Vec<Kind> = all.iter().map(|s| s.kind).collect();
+    kinds.sort();
+    kinds.dedup();
+
+    for kind in kinds {
+        let mut scores = Vec::new();
+        let (mut low, mut medium, mut high) = (0, 0, 0);
+
+        for s in all.iter().filter(|s| s.kind == kind) {
+            let scan = detect::scan(&s.request.payload.text, &s.detect);
+            let a = assess(&s.request, &scan, policy);
+            scores.push(a.score);
+            match a.decision {
+                Decision::Low => low += 1,
+                Decision::Medium => medium += 1,
+                Decision::High => high += 1,
+            }
+            if a.decision.needs_human() {
+                held_total += 1;
+            }
+            match kind.expectation() {
+                // 【最優先】ここが破れた案は、他がどれだけ良くても採れない。
+                Expectation::MustHold if a.decision == Decision::Low => {
+                    dangerous_auto.push(format!("{}({}点)", s.id, a.score));
+                }
+                Expectation::ShouldPassAuto if a.decision.needs_human() => {
+                    safe_held.push(format!("{}({}点)", s.id, a.score));
+                }
+                _ => {}
+            }
+        }
+
+        scores.sort_unstable();
+        let n = scores.len();
+        spread.push((kind, scores[0], scores[n / 2], scores[n - 1]));
+        decisions.push((kind, low, medium, high));
+    }
+
+    Report {
+        dangerous_auto,
+        safe_held,
+        held_total,
+        spread,
+        decisions,
+    }
+}
+
+fn compare_weights() {
+    let all = samples::all();
+    let proposals = proposals::weight_proposals();
+
+    line();
+    println!("  重み案の比較（{}件のサンプル）", all.len());
+    println!(
+        "  【重要】閾値は {}/{} に固定してあります。重みと閾値を同時に変えると、",
+        proposals::FIXED_THRESHOLDS.medium_at,
+        proposals::FIXED_THRESHOLDS.high_at
+    );
+    println!("  差がどちらから来たのか分からなくなります（諏訪の指示）");
+    line();
+    for p in &proposals {
+        println!(
+            "  案{}・{:<10} 操作{:>3} 送信先{:>3} 区分{:>3} PII{:>3}",
+            p.id,
+            p.label,
+            p.weights.action,
+            p.weights.destination,
+            p.weights.data_class,
+            p.weights.pii
+        );
+        println!("      {}", p.stance);
+    }
+
+    let reports: Vec<(&proposals::WeightProposal, Report)> = proposals
+        .iter()
+        .map(|p| (p, evaluate(&all, &p.policy())))
+        .collect();
+
+    line();
+    println!("  ① 危険な要求（型2・型4）が自動承認された件数 ← 必ず0であること");
+    line();
+    for (p, r) in &reports {
+        println!(
+            "  案{}  {:>2}件  {}",
+            p.id,
+            r.dangerous_auto.len(),
+            if r.dangerous_auto.is_empty() {
+                "✓".to_string()
+            } else {
+                format!("✗ {}", r.dangerous_auto.join("・"))
+            }
+        );
+    }
+
+    line();
+    println!("  ② 安全な要求（型1）が承認待ちに回った件数 ← 少ないほうが良い");
+    println!("  ③ 承認待ちの総件数（{}件中）", all.len());
+    line();
+    println!(
+        "  {:<6} {:>10} {:>12} {:>10}",
+        "案", "型1が回った", "承認待ち総数", "人手の割合"
+    );
+    for (p, r) in &reports {
+        println!(
+            "  案{:<5} {:>10} {:>12} {:>9}%",
+            p.id,
+            format!("{}件", r.safe_held.len()),
+            format!("{}件", r.held_total),
+            (r.held_total * 100).div_ceil(all.len())
+        );
+    }
+
+    line();
+    println!("  ④ 型ごとの点数分布（最小 / 中央 / 最大）と判定の内訳（LOW-MED-HIGH）");
+    line();
+    print!("  {:<22}", "型");
+    for (p, _) in &reports {
+        print!("{:<22}", format!("案{}", p.id));
+    }
+    println!();
+    for (i, (kind, _, _, _)) in reports[0].1.spread.iter().enumerate() {
+        print!("  型{} {:<18}", kind.number(), kind.label());
+        for (_, r) in &reports {
+            let (_, min, mid, max) = r.spread[i];
+            let (_, low, med, high) = r.decisions[i];
+            print!(
+                "{:<22}",
+                format!("{min:>3}/{mid:>3}/{max:>3}  {low}-{med}-{high}")
+            );
+        }
+        println!();
+    }
+
+    line();
+    println!("  ⑤ 次の段階（閾値）に残る自由度");
+    println!("  型1の最大点より上、型2の最小点以下——ここが閾値を置ける範囲です。");
+    println!("  狭い案を選ぶと、閾値の選択肢がその時点で減ります。");
+    line();
+    println!(
+        "  {:<6} {:>10} {:>10} {:>18}",
+        "案", "型1の最大", "型2の最小", "置ける範囲"
+    );
+    for (p, r) in &reports {
+        let safe_max = r
+            .spread
+            .iter()
+            .find(|(k, ..)| *k == Kind::InternalRead)
+            .unwrap()
+            .3;
+        let danger_min = r
+            .spread
+            .iter()
+            .find(|(k, ..)| *k == Kind::PatientToExternalAi)
+            .unwrap()
+            .1;
+        println!(
+            "  案{:<5} {:>10} {:>10} {:>18}",
+            p.id,
+            format!("{safe_max}点"),
+            format!("{danger_min}点"),
+            format!(
+                "{}〜{} （{}点幅）",
+                safe_max + 1,
+                danger_min,
+                danger_min - safe_max
+            )
+        );
+    }
+
+    line();
+    println!("  ⑥ 案によって分かれた要求（型3・5・6・7）");
+    println!("  ここが動くところです。型1と型2は、どの案でも動きません。");
+    line();
+    print!("  {:<10}", "ID");
+    for (p, _) in &reports {
+        print!("{:<14}", format!("案{}", p.id));
+    }
+    println!("内容");
+    for s in all
+        .iter()
+        .filter(|s| s.kind.expectation() == Expectation::Split)
+    {
+        let mut cells = Vec::new();
+        let mut differs = false;
+        let mut first: Option<Decision> = None;
+        for (p, _) in &reports {
+            let policy = p.policy();
+            let scan = detect::scan(&s.request.payload.text, &s.detect);
+            let a = assess(&s.request, &scan, &policy);
+            if first.is_none() {
+                first = Some(a.decision);
+            } else if first != Some(a.decision) {
+                differs = true;
+            }
+            cells.push(format!("{:>3}点 {:?}", a.score, a.decision));
+        }
+        // 動いたものに印を付ける。全案で同じものは、選定の材料にならない。
+        print!(
+            "  {:<10}",
+            format!("{}{}", s.id, if differs { " *" } else { "" })
+        );
+        for c in cells {
+            print!("{c:<14}");
+        }
+        println!("{}", s.note);
+    }
+    println!();
+    println!("  * 案によって判定が変わったもの");
+    line();
 }
 
 fn list_samples() {
