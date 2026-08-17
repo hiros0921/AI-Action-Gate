@@ -251,3 +251,91 @@ async fn 監査ログを上書きできないこと() {
         "あとから来たほうで上書きされている"
     );
 }
+
+#[tokio::test]
+#[ignore = "DynamoDB Local が要る"]
+async fn 版番号が書き込みのたびに増えること() {
+    // 【重要】304 の判定を GetItem 1回で済ませるための番号（第7段階前の改善）。
+    // 以前はここで承認待ちを全件 Scan していた。
+    let store = store().await;
+    let before = store.version().await;
+
+    let id = format!("test-version-{}", now());
+    store
+        .put(sample(&id, &chrono::Utc::now().to_rfc3339()))
+        .await;
+    let after_put = store.version().await;
+    assert!(after_put > before, "要求を足しても番号が変わらない");
+
+    store
+        .settle(
+            &id,
+            RequestState::Settled {
+                verdict: Verdict::Rejected,
+                returned_payload: None,
+                reviewer: "suwa".into(),
+                at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await;
+    assert!(
+        store.version().await > after_put,
+        "判断が下りても番号が変わらない"
+    );
+}
+
+#[tokio::test]
+#[ignore = "DynamoDB Local が要る"]
+async fn 判断が下りたら承認待ちの索引から落ちること() {
+    // 【重要】承認待ちだけが索引に載る（sparse index）。
+    // 承認済みが何万件たまっても、一覧の費用が増えないようにするため。
+    let store = store().await;
+    let id = format!("test-index-{}", now());
+    store
+        .put(sample(&id, &chrono::Utc::now().to_rfc3339()))
+        .await;
+
+    let pending = store.pending().await;
+    assert!(
+        pending.iter().any(|r| r.id == id),
+        "承認待ちが一覧に出ていない"
+    );
+
+    store
+        .settle(
+            &id,
+            RequestState::Settled {
+                verdict: Verdict::Approved,
+                returned_payload: None,
+                reviewer: "suwa".into(),
+                at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await;
+
+    let after = store.pending().await;
+    assert!(
+        !after.iter().any(|r| r.id == id),
+        "判断が下りたのに承認待ちに残っている"
+    );
+    // 判定結果そのものは消えていない。
+    assert!(store.get(&id).await.is_some());
+}
+
+#[tokio::test]
+#[ignore = "DynamoDB Local が要る"]
+async fn 版番号の項目が一覧に混ざらないこと() {
+    // #version は判定結果を持たない。要求として数えてはいけない。
+    let store = store().await;
+    store
+        .put(sample(
+            &format!("test-mix-{}", now()),
+            &chrono::Utc::now().to_rfc3339(),
+        ))
+        .await;
+
+    for r in store.all().await {
+        assert_ne!(r.id, "#version", "版番号の項目が要求として出ている");
+        assert!(!r.assessment.components.is_empty());
+    }
+}

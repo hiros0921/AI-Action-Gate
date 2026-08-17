@@ -17,7 +17,10 @@ use gate_core::review::{AuditEntry, Verdict};
 use gate_core::score::RiskAssessment;
 
 use crate::memory::{RequestState, RequestStore, StoredRequest};
-use crate::{PayloadStore, tables};
+use crate::{
+    PENDING_INDEX, PENDING_KEY_ATTRIBUTE, PENDING_KEY_VALUE, PENDING_SORT_ATTRIBUTE, PayloadStore,
+    VERSION_ITEM_KEY, tables,
+};
 
 /// 判断が下りてから、平文を消すまでの猶予。
 ///
@@ -43,6 +46,22 @@ impl DynamoStore {
             payloads: PayloadStore::new(client.clone()),
             client,
         }
+    }
+
+    /// 版番号を1つ増やす。書き込みのたびに呼ぶ。
+    ///
+    /// 【重要】これがあるおかげで、304 の判定が GetItem 1回で済みます。
+    /// 以前は「変わっていない」と答えるために全件 Scan していました。
+    async fn bump_version(&self) {
+        let _ = self
+            .client
+            .update_item()
+            .table_name(tables::REQUESTS)
+            .key("pk", AttributeValue::S(VERSION_ITEM_KEY.to_string()))
+            .update_expression("ADD n :one")
+            .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
+            .send()
+            .await;
     }
 
     fn now_epoch() -> i64 {
@@ -125,10 +144,14 @@ impl DynamoStore {
         })
     }
 
+    /// 全件を取る。**閾値シミュレーションと履歴だけが使います。**
+    ///
+    /// 【重要】ここは Scan のままです。承認待ちの一覧（毎秒のポーリング）は
+    /// 索引から引くので、Scan が走るのは人が画面を操作したときだけになりました。
+    /// シミュレーションは過去の全件を見る操作なので、Scan が筋です。
+    ///
+    /// 版番号の項目（`#version`）は判定結果を持たないので、hydrate が弾きます。
     async fn scan_requests(&self) -> Vec<StoredRequest> {
-        // 【重要】Scan を使っているのはプロトタイプだからです。
-        // 件数が増えたら、承認待ちを引く GSI（STATUS#PENDING）に替えます。
-        // 設計は第1段階で出してあります。
         let out = match self.client.scan().table_name(tables::REQUESTS).send().await {
             Ok(out) => out,
             Err(_) => return Vec::new(),
@@ -226,7 +249,17 @@ impl RequestStore for DynamoStore {
             );
 
         builder = match &request.state {
-            RequestState::Pending => builder.item("status", AttributeValue::S("pending".into())),
+            RequestState::Pending => builder
+                .item("status", AttributeValue::S("pending".into()))
+                // 索引に載せる。判断が下りたら消す。
+                .item(
+                    PENDING_KEY_ATTRIBUTE,
+                    AttributeValue::S(PENDING_KEY_VALUE.to_string()),
+                )
+                .item(
+                    PENDING_SORT_ATTRIBUTE,
+                    AttributeValue::S(request.created_at.clone()),
+                ),
             RequestState::Settled {
                 verdict,
                 returned_payload,
@@ -245,6 +278,7 @@ impl RequestStore for DynamoStore {
             }
         };
         let _ = builder.send().await;
+        self.bump_version().await;
 
         // 自動承認は、その場で判断が済んでいる。平文の時計をここで動かす。
         if !request.state.is_pending() {
@@ -268,11 +302,36 @@ impl RequestStore for DynamoStore {
     }
 
     async fn pending(&self) -> Vec<StoredRequest> {
-        self.scan_requests()
-            .await
-            .into_iter()
-            .filter(|r| r.state.is_pending())
-            .collect()
+        // 【重要】Scan ではなく索引から引きます。
+        //
+        // 承認待ちだけが載る索引（sparse index）なので、承認済みが何万件たまっても
+        // 一覧の費用は増えません。以前は全件 Scan していたため、
+        // 保存件数に比例して読み取り費用が増える構造でした（500件で月$17）。
+        let out = self
+            .client
+            .query()
+            .table_name(tables::REQUESTS)
+            .index_name(PENDING_INDEX)
+            .key_condition_expression("#k = :pending")
+            .expression_attribute_names("#k", PENDING_KEY_ATTRIBUTE)
+            .expression_attribute_values(
+                ":pending",
+                AttributeValue::S(PENDING_KEY_VALUE.to_string()),
+            )
+            .send()
+            .await;
+
+        let Ok(out) = out else {
+            return Vec::new();
+        };
+        let mut requests = Vec::new();
+        for item in out.items.unwrap_or_default() {
+            if let Some(r) = self.hydrate(item).await {
+                requests.push(r);
+            }
+        }
+        requests.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        requests
     }
 
     async fn all(&self) -> Vec<StoredRequest> {
@@ -297,10 +356,12 @@ impl RequestStore for DynamoStore {
             .update_item()
             .table_name(tables::REQUESTS)
             .key("pk", AttributeValue::S(id.to_string()))
+            // 【重要】判断が下りたら索引のキーを消す。承認待ちの索引から落ちる。
             .update_expression(
                 "SET #s = :settled, verdict = :v, reviewer = :r, decided_at = :d\
-                 , returned_payload = :p",
+                 , returned_payload = :p REMOVE #pending",
             )
+            .expression_attribute_names("#pending", PENDING_KEY_ATTRIBUTE)
             .expression_attribute_names("#s", "status")
             .expression_attribute_values(":settled", AttributeValue::S("settled".into()))
             .expression_attribute_values(":v", AttributeValue::S(verdict_key(*verdict)))
@@ -321,6 +382,7 @@ impl RequestStore for DynamoStore {
             .expression_attribute_values(":pending", AttributeValue::S("pending".into()));
 
         update.send().await.ok()?;
+        self.bump_version().await;
 
         // 判断が下りた。ここから平文の時計が動き出す。
         let _ = self
@@ -368,20 +430,29 @@ impl RequestStore for DynamoStore {
     }
 
     async fn version(&self) -> u64 {
-        // 【重要】DynamoDB 版では番号を持ちません。
-        // 承認待ちの件数と、最後に判断された時刻から作ります。
-        // 完璧ではありませんが、ポーリングの 304 判定にはこれで足ります。
-        let pending = self.pending().await;
-        let newest = pending
-            .iter()
-            .map(|r| r.created_at.as_str())
-            .max()
-            .unwrap_or("");
-        let mut hash = pending.len() as u64;
-        for b in newest.bytes() {
-            hash = hash.wrapping_mul(31).wrapping_add(u64::from(b));
+        // 【重要】1件だけ取ります（0.5 RRU）。
+        //
+        // 以前はここで承認待ちを全件 Scan していました。ETag で 304 を返しても、
+        // 「変わっていない」と確かめるために毎回 Scan していたので、
+        // **転送量は減っても読み取り費用は減っていませんでした**。
+        // 見積もりを作るまで気づけませんでした（メモリ版では番号がタダだったため）。
+        let out = self
+            .client
+            .get_item()
+            .table_name(tables::REQUESTS)
+            .key("pk", AttributeValue::S(VERSION_ITEM_KEY.to_string()))
+            .send()
+            .await;
+        match out {
+            Ok(o) => o
+                .item
+                .and_then(|i| match i.get("n") {
+                    Some(AttributeValue::N(n)) => n.parse::<u64>().ok(),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            Err(_) => 0,
         }
-        hash
     }
 }
 

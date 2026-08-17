@@ -1,0 +1,52 @@
+{
+  "Comment": [
+    "Lambda 実行ロールに付ける権限（仕様書7章・10章）。",
+    "【重要】監査ログの更新と削除を Deny で明示的に拒否する。",
+    "Deny は Allow より強いので、あとから広い Allow を足しても抜けない。",
+    "BatchWriteItem を忘れると、その中に DeleteRequest を入れて消せてしまう。",
+    "この Comment キーは説明用。aws iam put-role-policy に渡す前に削除すること。"
+  ],
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AuditLogsAppendOnly",
+      "Effect": "Deny",
+      "Action": [
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:BatchWriteItem",
+        "dynamodb:DeleteTable",
+        "dynamodb:UpdateTimeToLive"
+      ],
+      "Resource": "arn:aws:dynamodb:ap-northeast-1:ACCOUNT_ID:table/audit_logs"
+    },
+    {
+      "Sid": "AuditLogsWriteAndRead",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:GetItem"],
+      "Resource": "arn:aws:dynamodb:ap-northeast-1:ACCOUNT_ID:table/audit_logs"
+    },
+    {
+      "Sid": "RequestsAndPayloads",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:Scan"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:ap-northeast-1:ACCOUNT_ID:table/action_requests",
+        "arn:aws:dynamodb:ap-northeast-1:ACCOUNT_ID:table/action_requests/index/*",
+        "arn:aws:dynamodb:ap-northeast-1:ACCOUNT_ID:table/request_payloads"
+      ]
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:ap-northeast-1:ACCOUNT_ID:log-group:/aws/lambda/gate-api:*"
+    }
+  ]
+}

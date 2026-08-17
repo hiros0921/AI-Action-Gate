@@ -43,8 +43,8 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
-    ScalarAttributeType, TimeToLiveSpecification,
+    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
+    KeyType, Projection, ProjectionType, ScalarAttributeType, TimeToLiveSpecification,
 };
 
 pub mod tables {
@@ -56,6 +56,44 @@ pub mod tables {
 
 /// TTL に使う属性名。DynamoDB 側にもこの名前で登録する。
 pub const TTL_ATTRIBUTE: &str = "expires_at";
+
+/// 承認待ちだけを載せる索引（GSI）。
+///
+/// <div class="warning">
+///
+/// 【重要】承認待ちの取得に Scan を使わないための索引です（第7段階前の改善）。
+///
+/// 見積もりを作って分かりました。ポーリングのたびに全件 Scan していたので、
+/// **保存件数に比例して読み取り費用が増える**構造でした。500件で月$17。
+/// 金額の問題というより、スケールしない設計です。
+///
+/// この索引には**承認待ちだけ**が載ります（sparse index）。
+/// 判断が下りたら [`PENDING_KEY_ATTRIBUTE`] を消すので、索引から落ちます。
+/// 承認済みが何万件たまっても、一覧の費用は増えません。
+///
+/// </div>
+pub const PENDING_INDEX: &str = "pending_index";
+/// 承認待ちのときだけ入る属性。判断が下りたら消す（索引から外すため）。
+pub const PENDING_KEY_ATTRIBUTE: &str = "pending_key";
+/// 承認待ちを並べる順。
+pub const PENDING_SORT_ATTRIBUTE: &str = "created_at";
+/// [`PENDING_KEY_ATTRIBUTE`] に入れる値。承認待ちは全部この1つの区画に入る。
+pub const PENDING_KEY_VALUE: &str = "PENDING";
+
+/// 版番号を持つ項目のキー。
+///
+/// <div class="warning">
+///
+/// 【重要】ポーリングの 304 判定を、1回の GetItem で済ませるための項目です。
+///
+/// 見積もりで分かったこと: **ETag は転送量を減らしますが、読み取り費用は減らしません。**
+/// 「変わっていない」と答えるために全件 Scan していては、本文を作らない節約分しか効きません。
+/// メモリ版では番号がタダで持てたので、この差に気づいていませんでした。
+///
+/// 書き込みのたびにこの項目を1つ増やし、読むときは1件取るだけにします。
+///
+/// </div>
+pub const VERSION_ITEM_KEY: &str = "#version";
 
 /// 接続を作る。
 ///
@@ -85,7 +123,7 @@ pub async fn ensure_tables(client: &Client) -> Result<(), StoreError> {
     let names = existing.table_names();
 
     for (table, pk, sk) in [
-        // 判定結果。id だけで引く。
+        // 判定結果。id だけで引く。承認待ちは GSI から引く。
         (tables::REQUESTS, "pk", None),
         // 平文。id だけで引く。TTL を付ける。
         (tables::PAYLOADS, "pk", None),
@@ -113,6 +151,50 @@ pub async fn ensure_tables(client: &Client) -> Result<(), StoreError> {
                     .build()
                     .map_err(|e| StoreError::Aws(e.to_string()))?,
             );
+
+        // 承認待ちだけを載せる索引を、判定結果のテーブルに付ける。
+        if table == tables::REQUESTS {
+            builder = builder
+                .attribute_definitions(
+                    AttributeDefinition::builder()
+                        .attribute_name(PENDING_KEY_ATTRIBUTE)
+                        .attribute_type(ScalarAttributeType::S)
+                        .build()
+                        .map_err(|e| StoreError::Aws(e.to_string()))?,
+                )
+                .attribute_definitions(
+                    AttributeDefinition::builder()
+                        .attribute_name(PENDING_SORT_ATTRIBUTE)
+                        .attribute_type(ScalarAttributeType::S)
+                        .build()
+                        .map_err(|e| StoreError::Aws(e.to_string()))?,
+                )
+                .global_secondary_indexes(
+                    GlobalSecondaryIndex::builder()
+                        .index_name(PENDING_INDEX)
+                        .key_schema(
+                            KeySchemaElement::builder()
+                                .attribute_name(PENDING_KEY_ATTRIBUTE)
+                                .key_type(KeyType::Hash)
+                                .build()
+                                .map_err(|e| StoreError::Aws(e.to_string()))?,
+                        )
+                        .key_schema(
+                            KeySchemaElement::builder()
+                                .attribute_name(PENDING_SORT_ATTRIBUTE)
+                                .key_type(KeyType::Range)
+                                .build()
+                                .map_err(|e| StoreError::Aws(e.to_string()))?,
+                        )
+                        .projection(
+                            Projection::builder()
+                                .projection_type(ProjectionType::All)
+                                .build(),
+                        )
+                        .build()
+                        .map_err(|e| StoreError::Aws(e.to_string()))?,
+                );
+        }
 
         if let Some(sk) = sk {
             builder = builder
