@@ -19,7 +19,8 @@ use tower_http::cors::CorsLayer;
 
 use gate_api::routes;
 use gate_api::state::AppState;
-use gate_api::store::InMemoryStore;
+use gate_store::dynamo::{ABANDON_AFTER_SECONDS, DynamoStore};
+use gate_store::{InMemoryStore, RequestStore};
 
 #[tokio::main]
 async fn main() {
@@ -60,7 +61,31 @@ async fn main() {
         }
     };
 
-    let state = Arc::new(AppState::new(Arc::new(InMemoryStore::new()), policy));
+    // 置き場を選ぶ。ハンドラは trait しか知らないので、変わるのはここだけ。
+    //
+    //   GATE_STORE=dynamodb  DynamoDB（ローカルなら GATE_DYNAMO_ENDPOINT も指定）
+    //   （未指定）           メモリ。第3〜5段階と同じ
+    let mut store_kind = "in-memory";
+    let store: Arc<dyn RequestStore> = match std::env::var("GATE_STORE").as_deref() {
+        Ok("dynamodb") => {
+            let client = gate_store::connect().await;
+            if let Err(e) = gate_store::ensure_tables(&client).await {
+                eprintln!("テーブルを用意できません: {e}");
+                std::process::exit(2);
+            }
+            let store = Arc::new(DynamoStore::new(client));
+            store_kind = "dynamodb";
+            tracing::info!("DynamoDB に保存します");
+            spawn_sweeper(store.clone());
+            store
+        }
+        _ => {
+            tracing::warn!("メモリに保存します。落とすと消えます（GATE_STORE=dynamodb で永続化）");
+            Arc::new(InMemoryStore::new())
+        }
+    };
+
+    let state = Arc::new(AppState::new(store, policy).with_store_kind(store_kind));
     let app = routes::router(state).layer(CorsLayer::permissive());
 
     // ポートは 8090。8080 は別のプロジェクト（mendan-training）が使っているため、
@@ -86,6 +111,36 @@ async fn main() {
         .with_graceful_shutdown(shutdown())
         .await
         .expect("サーバが落ちました");
+}
+
+/// 放置された承認待ちを、期限切れとして閉じる。
+///
+/// <div class="warning">
+///
+/// 【重要】これが無いと、承認待ちのまま放置された平文が永久に残ります
+/// （諏訪の指示・第6段階）。TTL は「判断が下りてから」動き出すので、
+/// 判断が下りない要求には、いつまでも時計が動きません。
+///
+/// mensetsu の StaleSessionSweeper と同じ形です。切断や放置は必ず起きるので、
+/// 拾えなかったものを後から片付ける係が要ります。
+///
+/// </div>
+fn spawn_sweeper(store: Arc<DynamoStore>) {
+    tokio::spawn(async move {
+        // 起動時に1回、そのあとは1時間ごと。
+        loop {
+            let now = chrono::Utc::now().to_rfc3339();
+            let closed = store.expire_abandoned(ABANDON_AFTER_SECONDS, &now).await;
+            if closed > 0 {
+                tracing::info!(
+                    "{}日以上放置された承認待ち {}件を期限切れとして閉じました",
+                    ABANDON_AFTER_SECONDS / 86_400,
+                    closed
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
+        }
+    });
 }
 
 async fn shutdown() {

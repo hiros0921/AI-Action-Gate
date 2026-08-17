@@ -8,4 +8,5 @@
 pub mod approver;
 pub mod routes;
 pub mod state;
-pub mod store;
+/// 置き場は gate-store にあります（メモリ版と DynamoDB 版）。
+pub use gate_store as store;

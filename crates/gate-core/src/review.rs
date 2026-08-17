@@ -32,6 +32,20 @@ pub enum Verdict {
     ApprovedWithMasking,
     /// 実行させない。
     Rejected,
+    /// 誰も判断しないまま期限が切れた。
+    ///
+    /// <div class="warning">
+    ///
+    /// 【重要】人の「拒否」と分けます（諏訪の指示・第6段階）。
+    ///
+    /// > 「承認完了後24時間」だと、承認待ちのまま放置された平文が永久に残ります。
+    /// > 一定期間で「期限切れ」として閉じて、そこからTTLを開始する形にしてください。
+    ///
+    /// これを `Rejected` で表すと、監査ログ上「人が拒否した」ことになります。
+    /// 実際には誰も見ていません。**判断しなかったことも記録**です。
+    ///
+    /// </div>
+    Expired,
 }
 
 impl Verdict {
@@ -40,12 +54,13 @@ impl Verdict {
             Self::Approved => "承認",
             Self::ApprovedWithMasking => "マスキングして承認",
             Self::Rejected => "拒否",
+            Self::Expired => "期限切れ（誰も判断しなかった）",
         }
     }
 
     /// エージェントに実行を許すか。
     pub fn allows_execution(self) -> bool {
-        !matches!(self, Self::Rejected)
+        matches!(self, Self::Approved | Self::ApprovedWithMasking)
     }
 }
 
@@ -178,7 +193,8 @@ impl AuditEntry {
         match self.verdict {
             Verdict::Approved => self.decision == Decision::High,
             Verdict::Rejected => self.decision == Decision::Low,
-            Verdict::ApprovedWithMasking => false,
+            // 期限切れは人の判断ではないので、覆したことにならない。
+            Verdict::ApprovedWithMasking | Verdict::Expired => false,
         }
     }
 }
@@ -263,6 +279,28 @@ mod tests {
         }
         // 種別と件数は残る。
         assert!(json.contains("person_name"));
+    }
+
+    #[test]
+    fn 期限切れを人の拒否と混同しないこと() {
+        // 【重要】どちらも「実行させない」だが、記録としては別物。
+        // 拒否は人が見て決めたこと。期限切れは誰も見なかったこと。
+        assert!(!Verdict::Expired.allows_execution());
+        assert!(!Verdict::Rejected.allows_execution());
+        assert_ne!(Verdict::Expired, Verdict::Rejected);
+
+        let entry = AuditEntry::new(
+            "req-0001",
+            "2026-08-18T12:00:00Z",
+            Reviewer::System,
+            Verdict::Expired,
+            &assessment(),
+        );
+        assert!(
+            !entry.overrode_machine(),
+            "誰も判断していないのに覆したことになっている"
+        );
+        assert!(!entry.reviewer.is_human());
     }
 
     #[test]

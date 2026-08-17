@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use gate_core::policy::Policy;
 
-use crate::store::RequestStore;
+use gate_store::RequestStore;
 
 pub struct AppState {
     pub store: Arc<dyn RequestStore>,
@@ -27,6 +27,8 @@ pub struct AppState {
     ///
     /// </div>
     poll_interval_ms: u64,
+    /// 置き場の名前。画面と /api/health に出す。
+    store_kind: &'static str,
 }
 
 impl AppState {
@@ -40,10 +42,21 @@ impl AppState {
         poll_interval_ms: u64,
     ) -> Self {
         Self {
+            store_kind: "in-memory",
             store,
             policy: RwLock::new(policy),
             poll_interval_ms,
         }
+    }
+
+    /// 置き場の名前を差し替える（DynamoDB 版で使う）。
+    pub fn with_store_kind(mut self, kind: &'static str) -> Self {
+        self.store_kind = kind;
+        self
+    }
+
+    pub fn store_kind(&self) -> &'static str {
+        self.store_kind
     }
 
     /// 環境変数から。読めない値なら既定に落とす。

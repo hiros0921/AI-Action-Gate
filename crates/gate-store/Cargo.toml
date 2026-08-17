@@ -1,0 +1,17 @@
+[package]
+name = "gate-store"
+description = "DynamoDB への永続化。平文は別テーブルに切り出し、そこにだけ TTL を付ける"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gate-core = { path = "../gate-core" }
+aws-config.workspace = true
+aws-sdk-dynamodb.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -8,8 +8,9 @@ license.workspace = true
 
 [dependencies]
 gate-core = { path = "../gate-core" }
+gate-store = { path = "../gate-store" }
 axum.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

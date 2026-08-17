@@ -1,0 +1,30 @@
+# ローカル開発用の DynamoDB（仕様書8章）。
+#
+# 【重要】AWS へは繋ぎません。第7段階まではここで完結させます。
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    container_name: gate_dynamodb
+    # インメモリではなくファイルに落とす。落として立て直しても記録が残る。
+    #
+    # 【重要】置き場は /home/dynamodblocal/data。root で動かしている。
+    # 実測で踏んだ: 名前付きボリュームを /data に付けると、その入れ物は root 所有で作られ、
+    # 既定の実行ユーザ（dynamodblocal）が書けない。
+    # ログには「unable to open database file」だけが出て、API 側は応答を待ち続ける。
+    # ローカル開発用なのでこれでよいが、本番の話ではない。
+    user: root
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    working_dir: /home/dynamodblocal
+    ports:
+      # 8000 は使っているものが多いので 18000 にずらしてある。
+      - "${GATE_DYNAMO_PORT:-18000}:8000"
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null localhost:8000 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  dynamodb-data:

@@ -1,14 +1,16 @@
-//! 要求の置き場。第3段階はメモリ上だけ（仕様書11章）。
+//! 要求の置き場。メモリ版（第3段階）と DynamoDB 版（第6段階）。
 //!
 //! <div class="warning">
 //!
-//! 【重要】trait にしてあるのは、第6段階で DynamoDB に差し替えるためです。
+//! 【重要】trait にしてあるので、ハンドラは置き場の中身を知りません。
 //!
-//! ハンドラは [`RequestStore`] しか知りません。差し替えるときに触るのは
-//! `main.rs` の1行だけで、判定も画面も変わりません。
+//! メモリと DynamoDB を差し替えるときに触るのは `main.rs` の1行だけで、
+//! 判定も画面も変わりません。第3段階で先に trait にしておいたので、
+//! 第6段階では実装を1つ足すだけで済みました。
 //!
 //! </div>
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,10 +28,21 @@ pub struct StoredRequest {
     pub assessment: RiskAssessment,
     /// 承認画面で見せるための本文。
     ///
-    /// 【重要】ここだけが平文を持ちます。監査ログには入りません（仕様書7章）。
-    /// 第6段階では、この項目にだけ TTL を付けて自動で消す方針です
-    /// （第1段階の修正提案①。承認が終われば要らなくなるため）。
+    /// <div class="warning">
+    ///
+    /// 【重要】DynamoDB 版では、これは<b>別テーブル</b>に入ります（諏訪の指示・第6段階）。
+    ///
+    /// TTL はアイテム単位で丸ごと消すので、判定結果と同じアイテムに置くと
+    /// 内訳も閾値も一緒に消えます。それでは「平文を消したあとでも
+    /// シミュレーションできる」という利点が失われます。
+    ///
+    /// 期限切れで読めなくなった場合は空文字になります。
+    /// 「消えた」ことは [`StoredRequest::payload_available`] で分かります。
+    ///
+    /// </div>
     pub payload: String,
+    /// 平文がまだ読めるか。期限切れなら false。
+    pub payload_available: bool,
     pub mask_plan: MaskPlan,
     pub state: RequestState,
 }
@@ -56,17 +69,18 @@ impl RequestState {
 }
 
 /// 置き場。第6段階で DynamoDB 実装に差し替える。
+#[async_trait]
 pub trait RequestStore: Send + Sync {
-    fn put(&self, request: StoredRequest);
-    fn get(&self, id: &str) -> Option<StoredRequest>;
+    async fn put(&self, request: StoredRequest);
+    async fn get(&self, id: &str) -> Option<StoredRequest>;
     /// 承認待ちを古い順に。
-    fn pending(&self) -> Vec<StoredRequest>;
+    async fn pending(&self) -> Vec<StoredRequest>;
     /// 判定済みも含めて新しい順に。閾値シミュレーションが使う。
-    fn all(&self) -> Vec<StoredRequest>;
-    fn settle(&self, id: &str, state: RequestState) -> Option<StoredRequest>;
+    async fn all(&self) -> Vec<StoredRequest>;
+    async fn settle(&self, id: &str, state: RequestState) -> Option<StoredRequest>;
     /// 監査ログ。**追記のみ。** 消す関数も直す関数も用意しない。
-    fn append_audit(&self, entry: AuditEntry);
-    fn audit_log(&self) -> Vec<AuditEntry>;
+    async fn append_audit(&self, entry: AuditEntry);
+    async fn audit_log(&self) -> Vec<AuditEntry>;
 
     /// 状態が変わるたびに増える番号。
     ///
@@ -74,7 +88,7 @@ pub trait RequestStore: Send + Sync {
     /// 画面は数秒ごとに一覧を取りに来ますが、承認待ちは1日に数件しか増えません。
     /// この番号を ETag にして、変わっていなければ 304 を返せば、
     /// 本文を作らず、JSON にもせずに済みます。
-    fn version(&self) -> u64;
+    async fn version(&self) -> u64;
 }
 
 /// メモリ上の実装。
@@ -97,19 +111,20 @@ impl InMemoryStore {
     }
 }
 
+#[async_trait]
 impl RequestStore for InMemoryStore {
-    fn put(&self, request: StoredRequest) {
+    async fn put(&self, request: StoredRequest) {
         let id = request.id.clone();
         self.requests.write().unwrap().insert(id.clone(), request);
         self.order.write().unwrap().push(id);
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn get(&self, id: &str) -> Option<StoredRequest> {
+    async fn get(&self, id: &str) -> Option<StoredRequest> {
         self.requests.read().unwrap().get(id).cloned()
     }
 
-    fn pending(&self) -> Vec<StoredRequest> {
+    async fn pending(&self) -> Vec<StoredRequest> {
         let requests = self.requests.read().unwrap();
         self.order
             .read()
@@ -121,7 +136,7 @@ impl RequestStore for InMemoryStore {
             .collect()
     }
 
-    fn all(&self) -> Vec<StoredRequest> {
+    async fn all(&self) -> Vec<StoredRequest> {
         let requests = self.requests.read().unwrap();
         self.order
             .read()
@@ -133,7 +148,7 @@ impl RequestStore for InMemoryStore {
             .collect()
     }
 
-    fn settle(&self, id: &str, state: RequestState) -> Option<StoredRequest> {
+    async fn settle(&self, id: &str, state: RequestState) -> Option<StoredRequest> {
         let mut requests = self.requests.write().unwrap();
         let request = requests.get_mut(id)?;
         if !request.state.is_pending() {
@@ -145,15 +160,15 @@ impl RequestStore for InMemoryStore {
         Some(request.clone())
     }
 
-    fn append_audit(&self, entry: AuditEntry) {
+    async fn append_audit(&self, entry: AuditEntry) {
         self.audit.write().unwrap().push(entry);
     }
 
-    fn audit_log(&self) -> Vec<AuditEntry> {
+    async fn audit_log(&self) -> Vec<AuditEntry> {
         self.audit.read().unwrap().clone()
     }
 
-    fn version(&self) -> u64 {
+    async fn version(&self) -> u64 {
         self.version.load(Ordering::Relaxed)
     }
 }

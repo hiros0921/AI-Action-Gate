@@ -19,7 +19,21 @@ Rust（判定エンジンとAPI）/ Svelte（承認ダッシュボード）/ AWS
 
 ```bash
 cargo test                      # 103件。サーバもDBも立てずに全部通る
-cargo run -p gate-api           # http://127.0.0.1:8090
+cargo run -p gate-api           # http://127.0.0.1:8090（メモリに保存）
+```
+
+DynamoDB に保存する場合（第6段階）。
+
+```bash
+docker compose up -d            # DynamoDB Local（ポート 18000）
+GATE_STORE=dynamodb GATE_DYNAMO_ENDPOINT=http://localhost:18000 \
+  AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local AWS_REGION=ap-northeast-1 \
+  GATE_POLICY=policies/adopted.toml cargo run -p gate-api
+
+# DB が要る試験は明示的に呼ぶ（cargo test に Docker を要求しないため）
+GATE_DYNAMO_ENDPOINT=http://localhost:18000 AWS_ACCESS_KEY_ID=local \
+  AWS_SECRET_ACCESS_KEY=local AWS_REGION=ap-northeast-1 \
+  cargo test -p gate-store -- --ignored --test-threads=1
 ```
 
 承認ダッシュボードは別の端末で。
@@ -214,6 +228,34 @@ API Gateway を使う構成から外れます。**ローカルでは動くが本
   304 でも Lambda の呼び出し回数は数えられるので、**間隔がそのまま費用に効きます**。
   第7段階で月額を測ったあと、ここだけを動かして調整できます。
 
+### 平文をいつ消すか — 3つのテーブルで、消し方を分けています
+
+| テーブル | 中身 | 消える？ |
+|---|---|---|
+| `action_requests` | 判定結果・内訳・そのときの閾値。**平文なし** | 消しません |
+| `request_payloads` | 本文（平文）だけ | **消えます**（下記） |
+| `audit_logs` | 監査ログ | **消せません**（更新も削除も呼びません） |
+
+**平文と判定結果を同じアイテムに置いていません。** DynamoDB の TTL はアイテム単位で丸ごと消すので、
+同居させると内訳も閾値も一緒に消えます。それでは「平文を消したあとでも閾値シミュレーションができる」
+という利点が失われます。
+
+**平文の保持期間は、正確にはこうです。**
+
+> **承認完了から24時間で削除対象になります。実際の削除は最大48時間後になることがあるため、
+> アプリケーション側で期限切れの平文を返しません。**
+
+DynamoDB の TTL は「期限を過ぎてから通常48時間以内」に削除される仕組みで、
+削除されるまでのあいだ Query や Scan の結果に出続けます。
+`PayloadStore::get_payload` が読むたびに期限を確かめているのはそのためです。
+これが無いと、期限を過ぎた平文が読めてしまいます。
+
+**承認待ちのまま放置されたものは、7日で「期限切れ」として閉じます。**
+TTL は判断が下りてから動き出すので、判断が下りない要求には時計が動きません。
+閉じた記録は監査ログにも残します。**判断しなかったことも記録です。**
+そのため `Verdict` に `Expired` があり、人の「拒否」とは別に扱っています。
+どちらも実行はさせませんが、**拒否は人が見て決めたこと、期限切れは誰も見なかったこと**です。
+
 ### 判定は I/O から独立しています
 
 `gate-core` の依存に `tokio` も `axum` も `aws-sdk` もありません。混ざったらコンパイルが通りません。
@@ -270,6 +312,7 @@ crates/
   gate-api/    axum の HTTP API。受け取って渡すだけ
   gate-agent/  疑似エージェント CLI（本物のAIエージェントは作らない）
   gate-lab/    案を実測で比べる道具（重み・閾値の選定に使った）
+  gate-store/  置き場。メモリ版と DynamoDB 版（平文は別テーブル）
 dashboard/     承認ダッシュボード（Vite + Svelte）
 policies/      採用された設定
 ```
@@ -284,7 +327,7 @@ policies/      採用された設定
 - [x] 第3段階：Rust API（インメモリ）
 - [x] 第4段階：スコアリング基準の選定（実測して採用）
 - [x] 第5段階：Svelte ダッシュボード
-- [ ] 第6段階：DynamoDB 永続化と監査ログ
+- [x] 第6段階：DynamoDB 永続化と監査ログ
 - [ ] 第7段階：AWS へのデプロイ
 - [ ] 第8段階：通し確認と README 仕上げ
 

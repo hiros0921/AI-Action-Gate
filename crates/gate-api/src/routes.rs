@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::approver::Approver;
 use crate::state::AppState;
-use crate::store::{RequestState, StoredRequest};
+use gate_store::{RequestState, StoredRequest};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -107,23 +107,28 @@ async fn submit(
         created_at: now.clone(),
         assessment: assessment.clone(),
         payload: request.payload.text.clone(),
+        // メモリ版では常に読める。DynamoDB 版では期限切れで false になる。
+        payload_available: true,
         mask_plan: plan,
         state: state_after,
     };
-    state.store.put(stored);
+    state.store.put(stored).await;
 
     // 自動承認も監査ログに残す。
     //
     // 【重要】「人が承認したもの」だけを残すと、自動で通した分が記録に出てきません。
     // 閾値を緩めた結果どれだけ自動で通ったかが、あとから追えなくなります。
     if assessment.decision == Decision::Low {
-        state.store.append_audit(AuditEntry::new(
-            &id,
-            &now,
-            Reviewer::System,
-            Verdict::Approved,
-            &assessment,
-        ));
+        state
+            .store
+            .append_audit(AuditEntry::new(
+                &id,
+                &now,
+                Reviewer::System,
+                Verdict::Approved,
+                &assessment,
+            ))
+            .await;
     }
 
     Ok(Json(SubmitResponse {
@@ -160,7 +165,7 @@ async fn fetch(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<FetchResponse>, (StatusCode, Json<ErrorBody>)> {
-    let stored = state.store.get(&id).ok_or_else(|| not_found(&id))?;
+    let stored = state.store.get(&id).await.ok_or_else(|| not_found(&id))?;
     let a = &stored.assessment;
 
     let body = match &stored.state {
@@ -185,6 +190,8 @@ async fn fetch(
                 Verdict::Rejected => "rejected",
                 Verdict::Approved => "approved",
                 Verdict::ApprovedWithMasking => "approved_masked",
+                // 誰も判断しないまま閉じた。人の拒否とは区別する。
+                Verdict::Expired => "expired",
             },
             risk: a.decision,
             score: a.score,
@@ -236,7 +243,7 @@ pub struct QueueItem {
 ///
 /// </div>
 async fn queue(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap) -> Response {
-    let etag = format!("\"q{}\"", state.store.version());
+    let etag = format!("\"q{}\"", state.store.version().await);
     if headers
         .get(axum::http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -244,14 +251,15 @@ async fn queue(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMa
     {
         return (StatusCode::NOT_MODIFIED, [("etag", etag)]).into_response();
     }
-    let body = queue_items(&state);
+    let body = queue_items(&state).await;
     (StatusCode::OK, [("etag", etag)], Json(body)).into_response()
 }
 
-fn queue_items(state: &AppState) -> Vec<QueueItem> {
+async fn queue_items(state: &AppState) -> Vec<QueueItem> {
     (state
         .store
         .pending()
+        .await
         .into_iter()
         .map(|r| {
             let masked = r.mask_plan.apply(&r.payload);
@@ -296,6 +304,7 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Vec<HistoryItem>> {
     let items = state
         .store
         .all()
+        .await
         .into_iter()
         .filter_map(|r| match r.state {
             RequestState::Pending => None,
@@ -317,7 +326,8 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Vec<HistoryItem>> {
                 overrode_machine: match verdict {
                     Verdict::Approved => r.assessment.decision == Decision::High,
                     Verdict::Rejected => r.assessment.decision == Decision::Low,
-                    Verdict::ApprovedWithMasking => false,
+                    // 期限切れは人の判断ではないので、覆したことにならない。
+                    Verdict::ApprovedWithMasking | Verdict::Expired => false,
                 },
             }),
         })
@@ -373,6 +383,16 @@ async fn decide(
         "approve" => Verdict::Approved,
         "approve_masked" => Verdict::ApprovedWithMasking,
         "reject" => Verdict::Rejected,
+        // 【重要】期限切れは人が選ぶものではない。掃除する側だけが付ける。
+        "expired" => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    message: "期限切れは人が選ぶ判断ではありません".to_string(),
+                    details: vec![],
+                }),
+            ));
+        }
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -384,25 +404,43 @@ async fn decide(
         }
     };
 
-    let stored = state.store.get(&id).ok_or_else(|| not_found(&id))?;
+    let stored = state.store.get(&id).await.ok_or_else(|| not_found(&id))?;
     let now = state.now();
 
     // マスキング承認なら、返すのは伏せ字にしたほう（仕様書5章）。
+    // 【重要】平文が期限切れで消えていたら、承認しても返すものがありません。
+    // 「消えた本文を承認した」という記録だけが残るのは筋が通らないので、ここで止めます。
+    if !stored.payload_available && verdict != Verdict::Rejected {
+        return Err((
+            StatusCode::GONE,
+            Json(ErrorBody {
+                message: "この要求の本文は保持期限を過ぎています".to_string(),
+                details: vec![
+                    "判断が下りてから24時間で平文を消しています。拒否のみ行えます".to_string(),
+                ],
+            }),
+        ));
+    }
+
     let returned = match verdict {
         Verdict::Approved => Some(stored.payload.clone()),
         Verdict::ApprovedWithMasking => Some(stored.mask_plan.apply(&stored.payload)),
-        Verdict::Rejected => None,
+        // 拒否と期限切れは、返すものが無い。
+        Verdict::Rejected | Verdict::Expired => None,
     };
 
-    let settled = state.store.settle(
-        &id,
-        RequestState::Settled {
-            verdict,
-            returned_payload: returned,
-            reviewer: reviewer.describe(),
-            at: now.clone(),
-        },
-    );
+    let settled = state
+        .store
+        .settle(
+            &id,
+            RequestState::Settled {
+                verdict,
+                returned_payload: returned,
+                reviewer: reviewer.describe(),
+                at: now.clone(),
+            },
+        )
+        .await;
 
     if settled.is_none() {
         // 【重要】承認済みのものを二度承認させない。
@@ -415,13 +453,16 @@ async fn decide(
         ));
     }
 
-    state.store.append_audit(AuditEntry::new(
-        &id,
-        &now,
-        reviewer.clone(),
-        verdict,
-        &stored.assessment,
-    ));
+    state
+        .store
+        .append_audit(AuditEntry::new(
+            &id,
+            &now,
+            reviewer.clone(),
+            verdict,
+            &stored.assessment,
+        ))
+        .await;
 
     Ok(Json(DecisionResponse {
         request_id: id,
@@ -432,7 +473,7 @@ async fn decide(
 }
 
 async fn audit(State(state): State<Arc<AppState>>) -> Json<Vec<AuditEntry>> {
-    Json(state.store.audit_log())
+    Json(state.store.audit_log().await)
 }
 
 #[derive(Debug, Serialize)]
@@ -508,7 +549,7 @@ async fn simulate(
     })?;
 
     let policy = state.policy();
-    let requests = state.store.all();
+    let requests = state.store.all().await;
 
     let mut current = Tally::default();
     let mut proposed = Tally::default();
@@ -579,7 +620,8 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "policy": state.policy().version,
-        "store": "in-memory",
+        // 【重要】固定文字を返さない。どちらで動いているかを取り違える。
+        "store": state.store_kind(),
     }))
 }
 
