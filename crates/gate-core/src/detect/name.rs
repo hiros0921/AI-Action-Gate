@@ -28,9 +28,30 @@ use regex::Regex;
 use super::{Confidence, Evidence, Finding, PiiKind};
 
 /// 敬称つき。`(名前)(敬称)` の形。
+///
+/// <div class="warning">
+///
+/// 【重要】漢字の敬称（様・氏・殿）と、ひらがなの敬称（さん・さま）を分けて扱います。
+///
+/// 実測で見つけました。`製品仕様` を「製品仕」＋「様」と読んで、
+/// **High の氏名として拾っていました**。仕様・模様・同様・多様——
+/// 漢字の敬称は、それ自体が熟語の一部になります。
+/// 「〜者」を語尾で外したときと同じ形の抜けですが、今度は敬称の側にありました。
+///
+/// ひらがなの敬称にはこの問題がありません。`製品仕さん` とは書かないためです。
+/// そこで、**漢字の敬称のときだけ姓の辞書を要求**します。
+///
+/// 代償: 辞書に無い姓＋様（例: 珍しい姓）は High で拾えず、Medium 以下になります。
+/// 辞書を厚くすれば減りますが、ゼロにはなりません。
+/// 誤検出で承認画面が埋まるほうが害が大きい、という判断です。
+///
+/// </div>
 static HONORIFIC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"([\p{Han}]{2,4}|[\p{Katakana}ー]{2,8})(さん|様|氏|殿|さま)").unwrap()
+    Regex::new(r"([\p{Han}]{2,4}|[\p{Katakana}ー]{2,8})(さん|さま|様|氏|殿)").unwrap()
 });
+
+/// 熟語を作りうる漢字の敬称。
+const KANJI_HONORIFICS: [&str; 3] = ["様", "氏", "殿"];
 
 /// ラベルつき。`氏名：山田太郎` の形。
 static LABELED: LazyLock<Regex> = LazyLock::new(|| {
@@ -227,6 +248,17 @@ pub fn detect(text: &str) -> Vec<Finding> {
         if is_role_word(name.as_str()) {
             continue;
         }
+        // 漢字の敬称は熟語を作る。姓の辞書で裏を取れないものは言い切らない。
+        let kanji_honorific = KANJI_HONORIFICS.contains(&honorific);
+        let looks_like_kanji_name = name.as_str().chars().all(|c| !c.is_ascii())
+            && SURNAMES.iter().any(|s| name.as_str().starts_with(s));
+        let katakana = name
+            .as_str()
+            .chars()
+            .all(|c| matches!(c, 'ァ'..='ヶ' | 'ー'));
+        if kanji_honorific && !katakana && !looks_like_kanji_name {
+            continue;
+        }
         found.push(
             Finding::new(
                 PiiKind::PersonName,
@@ -336,6 +368,35 @@ mod tests {
             name.confidence <= Confidence::Medium,
             "姓だけで言い切っている"
         );
+    }
+
+    #[test]
+    fn 漢字の敬称が熟語を人名にしないこと() {
+        // 【重要】実測で見つけた。「製品仕様」を「製品仕」＋「様」と読んでいた。
+        // この仕様書を扱うシステムで「仕様」が氏名になるのは、いちばん困る形。
+        for text in [
+            "公開中の製品仕様を、取引先のポータルへ登録します。",
+            "前回と同様の手順で進めます",
+            "多様な形式に対応しています",
+            "地図の模様を確認しました",
+        ] {
+            let found = detect(text);
+            assert!(
+                !found.iter().any(|f| f.confidence == Confidence::High),
+                "{text} で氏名を言い切っている: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 辞書にある姓なら漢字の敬称でも拾うこと() {
+        for text in ["田中様", "山田様よりご連絡", "佐藤氏の見解", "鈴木殿"] {
+            let found = detect(text);
+            assert!(
+                found.iter().any(|f| f.confidence == Confidence::High),
+                "{text} を拾えていない"
+            );
+        }
     }
 
     #[test]

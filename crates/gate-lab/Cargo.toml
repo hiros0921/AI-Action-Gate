@@ -1,0 +1,11 @@
+[package]
+name = "gate-lab"
+description = "案を比べるための道具。サンプル要求を各案で採点して並べる（第4段階）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gate-core = { path = "../gate-core" }
+clap.workspace = true

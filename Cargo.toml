@@ -5,7 +5,7 @@
 # 依存関係の側で守らせる。うっかり混ざったらコンパイルが通らない。
 [workspace]
 resolver = "3"
-members = ["crates/gate-core", "crates/gate-api", "crates/gate-agent"]
+members = ["crates/gate-core", "crates/gate-api", "crates/gate-agent", "crates/gate-lab"]
 
 [workspace.package]
 version = "0.1.0"

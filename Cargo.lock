@@ -380,6 +380,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate-lab"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gate-core",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

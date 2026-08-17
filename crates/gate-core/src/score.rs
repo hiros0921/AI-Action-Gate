@@ -70,6 +70,19 @@ pub struct RiskAssessment {
     pub thresholds: Thresholds,
     pub policy_version: String,
     pub components: Vec<Component>,
+    /// 100 で切る前の合計。**判定には使いません。**
+    ///
+    /// <div class="warning">
+    ///
+    /// 【重要】諏訪の指示（第4段階）:
+    ///
+    /// > 「100点だが危険要因は1つ」と「100点で危険要因が3つ」は、監査上まったく違う。
+    ///
+    /// 判定はどちらも HIGH で同じですが、記録としては別物です。
+    /// 頭打ちで潰れた分をここに残しておくと、内訳表示で違いを見せられます。
+    ///
+    /// </div>
+    pub raw_total: u16,
     /// 合計が 100 を超えて頭打ちになったか。
     ///
     /// 【重要】黙って丸めると「なぜ82点か」の説明が合わなくなります。
@@ -158,6 +171,8 @@ pub fn assess(request: &ActionRequest, scan: &Scan, policy: &Policy) -> RiskAsse
 
     let total: f32 = components.iter().map(|c| c.points).sum();
     let clamped = total > 100.0;
+    // 【重要】切る前の合計を残す。判定には使わない（諏訪の指示・第4段階）。
+    let raw_total = total.round().max(0.0) as u16;
     let score = total.round().clamp(0.0, 100.0) as u8;
 
     // 走査していない本文は、下限まで引き上げる。
@@ -179,6 +194,7 @@ pub fn assess(request: &ActionRequest, scan: &Scan, policy: &Policy) -> RiskAsse
         thresholds: policy.thresholds,
         policy_version: policy.version.clone(),
         components,
+        raw_total,
         clamped,
         conclusive,
         raised_by_uncertainty: decision != by_score,
@@ -292,6 +308,49 @@ mod tests {
         let sum: f32 = a.components.iter().map(|c| c.points).sum();
         assert_eq!(a.score, sum.round() as u8);
         assert!(!a.clamped);
+    }
+
+    #[test]
+    fn 頭打ちで潰れた分が残ること() {
+        // 【重要】判定はどちらも HIGH でも、記録としては別物。
+        //   「100点だが危険要因は1つ」と「100点で危険要因が3つ」は、監査上まったく違う。
+        // どちらも頭打ちで100点。違うのは、潰れた量。
+        let fewer = assess_text(
+            ActionKind::Delete,
+            Destination::ExternalAi,
+            DataClass::Sensitive,
+            "カード 4242-4242-4242-4242 で決済した記録を削除します。連絡先 090-1234-5678",
+        );
+        let more = assess_text(
+            ActionKind::Delete,
+            Destination::ExternalAi,
+            DataClass::Sensitive,
+            "山田太郎さん（1980年3月15日生・090-1234-5678）のカード 4242-4242-4242-4242 と \
+             メール taro@example.com の記録を削除します",
+        );
+
+        assert_eq!(fewer.score, 100);
+        assert_eq!(more.score, 100, "表示上の点は同じ");
+        assert!(
+            more.raw_total > fewer.raw_total,
+            "潰れた分が残っていないので、監査上この2件を区別できない（{} vs {}）",
+            fewer.raw_total,
+            more.raw_total
+        );
+    }
+
+    #[test]
+    fn 生の合計は判定に使わないこと() {
+        // raw_total は記録用。三分岐は 0〜100 に切ったあとの score で決める。
+        let a = assess_text(
+            ActionKind::Delete,
+            Destination::ExternalAi,
+            DataClass::Sensitive,
+            "山田太郎さん（1980年3月15日生・090-1234-5678）カード 4242-4242-4242-4242",
+        );
+        assert!(a.raw_total > 100);
+        assert_eq!(a.score, 100);
+        assert_eq!(a.decision, Policy::provisional().decide(a.score));
     }
 
     #[test]
