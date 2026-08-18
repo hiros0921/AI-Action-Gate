@@ -89,25 +89,63 @@ cargo install cargo-lambda             # まだなら
 aws --version                          # 入ったか確認
 ```
 
-次に、認証情報を通します。**ここが手順0より前です。**
+### 作業用の IAM ユーザを作る（🔑 ルートのキーは使わない）
 
-```bash
-aws configure
-#   AWS Access Key ID     : （IAMユーザのアクセスキー）
-#   AWS Secret Access Key : （同上）
-#   Default region name   : ap-northeast-1
-#   Default output format : json
+> **【重要】ルートアカウントのアクセスキーは使わないでください。**
+>
+> 権限が無制限で、**絞ることも、取り消しの影響範囲を限定することもできません**。
+> AWS 自身も非推奨としています。作業用の IAM ユーザを1つ作って、そのキーを使います。
 
-# 誰として繋がっているか、どのアカウントかを確認
-aws sts get-caller-identity
-```
+コンソールで作るのがいちばん早いです（キーの発行にキーが要るため）。
+
+**AWS マネジメントコンソール → IAM → ユーザー → ユーザーの作成**
+
+1. ユーザー名: `gate-deployer`
+2. 「AWS マネジメントコンソールへのアクセスを提供する」は**チェックしない**（CLI だけで使う）
+3. 許可の設定 → **ポリシーを直接アタッチする** → いったん何も付けずに作成
+4. 作成後、ユーザー → セキュリティ認証情報 → **アクセスキーを作成**
+   用途は「コマンドラインインターフェイス (CLI)」
 
 **【重要】アクセスキーはこの会話に貼らないでください。** `aws configure` に直接入力します。
 （MENSETSU の API キーと同じ扱いです。こちらは値を見ず、動いたかどうかだけ確認します）
 
-キーをまだ作っていない場合は、AWS マネジメントコンソールの
-IAM → ユーザー → セキュリティ認証情報 → アクセスキーの作成 から。
-用途を聞かれたら「コマンドラインインターフェイス (CLI)」を選びます。
+```bash
+aws configure
+#   AWS Access Key ID     : （gate-deployer のアクセスキー）
+#   AWS Secret Access Key : （同上）
+#   Default region name   : ap-northeast-1
+#   Default output format : json
+
+# 誰として繋がっているか。arn の末尾が user/gate-deployer であること（root ではない）
+aws sts get-caller-identity
+```
+
+### 作業用ユーザに、必要なぶんだけ権限を付ける
+
+`AdministratorAccess` は付けません。**このプロジェクトで触るサービスに絞ってあります。**
+`iam` の権限は `gate-api-role` にだけ効くようにしてあるので、
+他のロールを作ったり、自分の権限を広げたりはできません。
+
+コンソールの IAM → ポリシー → ポリシーの作成 → JSON に、
+`infra/deployer-policy.json` の中身（`Comment` を除き、`ACCOUNT_ID` を実際の12桁に置換）
+を貼り、`gate-deployer-policy` という名前で作成 → `gate-deployer` にアタッチします。
+
+置換したものを手元で作るなら:
+
+```bash
+ACCOUNT_ID=<12桁のアカウントID>   # コンソール右上のアカウントメニューに出ています
+python3 -c "
+import json
+p = json.load(open('infra/deployer-policy.json'))
+p.pop('Comment', None)
+print(json.dumps(p, indent=2).replace('ACCOUNT_ID', '$ACCOUNT_ID'))
+" > /tmp/deployer-policy.json
+cat /tmp/deployer-policy.json    # これをコンソールに貼る
+```
+
+**権限が足りずに `AccessDenied` が出たら、エラー文に不足しているアクション名が入っています。**
+それを `deployer-policy.json` に足してください。**先に広げないでください。**
+「何が必要だったか」がそのまま記録になります。
 
 ---
 
@@ -442,6 +480,42 @@ cat infra/evidence/teardown.txt
 
 **予算アラートは残して構いません**（無料）。消し忘れに気づく最後の砦になります。
 
+### 🔑 最後に、アクセスキーを無効化する
+
+**リソースを全部消しても、アクセスキーは有効なまま残ります。**
+あとから漏れたときに、そのまま使えてしまいます。
+
+**【重要】順番があります。** キーを消すと `aws` コマンドが動かなくなるので、
+**上の `teardown.txt` を取り終えてから**実行してください。
+
+```bash
+# いま使っているキーのIDを確認
+aws iam list-access-keys --user-name gate-deployer \
+  --query 'AccessKeyMetadata[].{id:AccessKeyId,status:Status,created:CreateDate}'
+
+KEY_ID=<上で出たアクセスキーID>
+
+# ① まず無効化（消す前に止める。戻せる状態を1つ挟む）
+aws iam update-access-key --user-name gate-deployer --access-key-id "$KEY_ID" --status Inactive
+aws iam list-access-keys --user-name gate-deployer --query 'AccessKeyMetadata[].Status'
+#   → ["Inactive"] と出れば、このキーではもう何もできません
+
+# ② 消す（ここから先、aws コマンドは通らなくなります）
+aws iam delete-access-key --user-name gate-deployer --access-key-id "$KEY_ID"
+```
+
+**手元に残った認証情報も消します。** `aws configure` はファイルに平文で書きます。
+
+```bash
+grep -n "aws_access_key_id" ~/.aws/credentials    # 残っていることを確認
+# 該当の profile を削除するか、ファイルごと消す
+rm ~/.aws/credentials
+ls -la ~/.aws/
+```
+
+ユーザ自体を残しておけば、次に動かすときはコンソールからキーを作り直すだけで再開できます。
+消す場合は、アタッチしたポリシーを外してから削除します（コンソールからのほうが確実です）。
+
 ---
 
 ## 実行の記録（チェックリスト）
@@ -449,6 +523,7 @@ cat infra/evidence/teardown.txt
 | | 手順 | 証跡 |
 |---|---|---|
 | ☐ | 0. 予算アラート（ACTUAL 50% ＋ FORECASTED 80%） | `describe-budgets` の出力 |
+| ☐ | 1. **IAM ユーザ `gate-deployer`**（ルートのキーは使わない） | `get-caller-identity` の arn |
 | ☐ | 1〜2. ビルド | — |
 | ☐ | 3. DynamoDB 3テーブル ＋ TTL ＋ PITR | — |
 | ☐ | 4. IAM ロール（Deny つき） | — |
@@ -458,3 +533,5 @@ cat infra/evidence/teardown.txt
 | ☐ | 6. **IAM Simulator で Deny を証明** | `iam-simulate-audit.json` |
 | ☐ | 6. スクリーンショット | `*.png` |
 | ☐ | 7. **その日のうちに削除** | `teardown.txt` |
+| ☐ | 7. **アクセスキーを無効化 → 削除**（証跡を取り終えてから） | `list-access-keys` が `Inactive` |
+| ☐ | 7. `~/.aws/credentials` から手元のキーも消す | — |
