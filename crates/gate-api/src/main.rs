@@ -69,9 +69,20 @@ async fn main() {
     let store: Arc<dyn RequestStore> = match std::env::var("GATE_STORE").as_deref() {
         Ok("dynamodb") => {
             let client = gate_store::connect().await;
-            if let Err(e) = gate_store::ensure_tables(&client).await {
-                eprintln!("テーブルを用意できません: {e}");
-                std::process::exit(2);
+            // 【重要】テーブルを作るのはローカル開発のときだけ。
+            //
+            // AWS 上のテーブルはデプロイ手順（infra/DEPLOY.md 手順3）が作る。
+            // Lambda のロールには CreateTable も ListTables も渡していない（最小権限）。
+            //
+            // 実測で踏んだ: ここで ensure_tables を呼ぶと AccessDenied →
+            // exit(2) → Runtime.ExitError で、関数が一度も起動しない。
+            // 「アプリがテーブルを作る」はローカルの便利機能であって、
+            // 本番の権限設計とは両立しない。
+            if std::env::var("AWS_LAMBDA_FUNCTION_NAME").is_err() {
+                if let Err(e) = gate_store::ensure_tables(&client).await {
+                    eprintln!("テーブルを用意できません: {e}");
+                    std::process::exit(2);
+                }
             }
             let store = Arc::new(DynamoStore::new(client));
             store_kind = "dynamodb";
