@@ -11,8 +11,9 @@
 止め方    このファイルの最後。★その日のうちに止めます★
 ```
 
-**0番から順に、飛ばさずに実行してください。** 予算アラートを先に置いてあるのは、
-デプロイしてから設定すると、その間に起きた事故に気づけないためです。
+**手順1（AWS CLI の用意）→ 手順0（予算アラート）→ 2番以降**の順です。
+番号がねじれていますが、**予算アラートを他のどのリソース作成よりも先に置く**ためにこうしています。
+デプロイしてから設定すると、その間に起きた事故に気づけません。
 
 **証跡は `infra/evidence/` に保存してください。** 各手順に `> infra/evidence/...` を入れてあります。
 あとから「本当に消したのか」「本当に消せない設定なのか」を確かめられる形にするためです。
@@ -77,11 +78,36 @@ aws budgets describe-budgets --account-id "$ACCOUNT_ID" --query 'Budgets[].Budge
 
 ## 1. 必要なもの
 
+**【重要】この環境には AWS CLI が入っていません。** 手順0の予算アラートからして
+`aws` を使うので、いちばん先に入れます。
+
 ```bash
+brew install awscli                    # ← これが入っていませんでした
 brew install zig                       # クロスコンパイル用
 cargo install cargo-lambda             # まだなら
-aws sts get-caller-identity            # 認証情報が通っているか確認
+
+aws --version                          # 入ったか確認
 ```
+
+次に、認証情報を通します。**ここが手順0より前です。**
+
+```bash
+aws configure
+#   AWS Access Key ID     : （IAMユーザのアクセスキー）
+#   AWS Secret Access Key : （同上）
+#   Default region name   : ap-northeast-1
+#   Default output format : json
+
+# 誰として繋がっているか、どのアカウントかを確認
+aws sts get-caller-identity
+```
+
+**【重要】アクセスキーはこの会話に貼らないでください。** `aws configure` に直接入力します。
+（MENSETSU の API キーと同じ扱いです。こちらは値を見ず、動いたかどうかだけ確認します）
+
+キーをまだ作っていない場合は、AWS マネジメントコンソールの
+IAM → ユーザー → セキュリティ認証情報 → アクセスキーの作成 から。
+用途を聞かれたら「コマンドラインインターフェイス (CLI)」を選びます。
 
 ---
 
