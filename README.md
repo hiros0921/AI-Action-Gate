@@ -455,10 +455,6 @@ cargo run -p gate-lab -- thresholds   # 閾値案の比較（重みは固定）
 
 ![監査ログ](infra/evidence/audit.png)
 
-承認者IDを入れていない状態。**API が 401 を返すので、誰が承認したか空の記録は作れません。**
-
-![承認者ID未入力](infra/evidence/queue-no-approver.png)
-
 ### 3経路の通し
 
 `aws lambda invoke` を10回。全文は [`infra/evidence/aws-run.txt`](infra/evidence/aws-run.txt) です。
