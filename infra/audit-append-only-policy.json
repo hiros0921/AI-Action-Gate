@@ -45,8 +45,11 @@
     {
       "Sid": "Logs",
       "Effect": "Allow",
-      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
-      "Resource": "arn:aws:logs:ap-northeast-1:ACCOUNT_ID:log-group:/aws/lambda/gate-api:*"
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": [
+        "arn:aws:logs:ap-northeast-1:ACCOUNT_ID:log-group:/aws/lambda/gate-api",
+        "arn:aws:logs:ap-northeast-1:ACCOUNT_ID:log-group:/aws/lambda/gate-api:*"
+      ]
     }
   ]
 }
