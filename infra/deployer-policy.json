@@ -112,13 +112,15 @@
     {
       "Sid": "BudgetsAndIdentity",
       "Effect": "Allow",
-      "Action": [
-        "budgets:CreateBudget",
-        "budgets:DescribeBudgets",
-        "budgets:ViewBudget",
-        "budgets:ModifyBudget",
-        "sts:GetCallerIdentity"
+      "Comment2": [
+        "【重要】Budgets の IAM アクションは ViewBudget と ModifyBudget の2つだけ。",
+        "CreateBudget / DescribeBudgets という IAM アクションは存在しない。",
+        "API 名とIAMアクション名が一致しないサービスがある、という例。",
+        "実測で踏んだ: コンソールのポリシーエディタが2件のエラーとして出した。",
+        "  aws budgets create-budget    → budgets:ModifyBudget で認可",
+        "  aws budgets describe-budgets → budgets:ViewBudget で認可"
       ],
+      "Action": ["budgets:ViewBudget", "budgets:ModifyBudget", "sts:GetCallerIdentity"],
       "Resource": "*"
     }
   ]
