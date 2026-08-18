@@ -547,17 +547,40 @@ if std::env::var("AWS_LAMBDA_FUNCTION_NAME").is_err() {
 Lambda の実行環境は起動時に取得した認証情報を使い回すので、
 **ロールを直しても、動いている実行環境にはすぐ反映されません。**
 
-**③ Function URL が 403 を返し続けた**
+**③ Function URL が 403 を返し続けた — 許可が片方だけだった**
 
-`AuthType=NONE` にして、`Principal: "*"` の resource-based policy も入れているのに
-`AccessDeniedException` が返る状態が続きました。最終的に、**statement-id を変えて
-同じ権限を入れ直したら通りました。**
+`AuthType=NONE` にしても、それだけでは通りません。関数に付くリソースベースポリシーが要ります。
+入れてあったのは `lambda:InvokeFunctionUrl` だけで、**`lambda:InvokeFunction` のほうが
+抜けていました。** これを足した瞬間に 403 が 200 になりました。
 
-**原因は特定できていません。** 関数を削除したあとなので、これ以上は追えません。
-ただ、切り分けが遅れた理由ははっきりしています。**作業用ユーザに `lambda:GetPolicy` を
-入れていなかったため、「いま実際に効いているポリシー」を最後まで読めませんでした。**
-最小権限で始めたこと自体は正しいのですが、**壊れたときに中を見るための読み取り権限は、
-最初から入れておくべき**でした。
+```bash
+# 足りていなかったほう。Function URL 経由に限定して開く
+aws lambda add-permission --function-name gate-api \
+  --statement-id FunctionUrlInvokeFunction \
+  --action lambda:InvokeFunction \
+  --principal '*' \
+  --invoked-via-function-url          # ← 条件: lambda:InvokedViaFunctionUrl = true
+```
+
+**`--invoked-via-function-url` を付けているのが要点です。** これが無いと
+`lambda:InvokeFunction` を誰にでも開くことになり、**URL 以外の経路（SDK からの直接呼び出し）
+まで公開されます。** 条件を付けることで、許可の範囲が「URL 経由で来たものだけ」に閉じます。
+`Principal: "*"` は同じでも、開いている面積が違います。
+
+名前が似た2つの権限が要り、**片方だけでもエラーにはならず 403 が返るだけ**なので、
+外から見ると「認証が通っていない」としか分かりません。
+
+切り分けが遅れた理由のほうが、学びとしては大きいと思っています。
+**作業用ユーザに `lambda:GetPolicy` を入れていなかったため、
+「いま実際に効いている許可」を読む手段がありませんでした。**
+最小権限で始めたこと自体は正しいのですが、**壊れたときに中を見るための読み取り権限は例外**です。
+
+```bash
+aws lambda get-policy --function-name gate-api --query 'Policy' --output text | python3 -m json.tool
+```
+
+これが最初から使えていれば、「`InvokeFunctionUrl` はあるが `InvokeFunction` が無い」と
+すぐ見えていました。
 
 この間も、`aws lambda invoke` で関数が正常に動くことは確認できていました。
 **URL は入口であって、確かめたいものではありません。** 通し確認を invoke で組んであるのは、

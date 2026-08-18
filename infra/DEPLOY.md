@@ -297,6 +297,47 @@ aws lambda get-function-url-config --function-name gate-api \
   --query '{url:FunctionUrl, auth:AuthType}'
 ```
 
+### 🔥 URL が 403 を返すとき（実測で踏んだ）
+
+**`AuthType` が `NONE` でも、それだけでは通りません。** リソースベースポリシー（関数に付く許可）
+が要ります。**実測では、次の2つを両方入れて初めて 200 になりました。**
+
+```bash
+# ① Function URL 用の許可
+aws lambda add-permission --function-name gate-api \
+  --statement-id FunctionUrlInvoke \
+  --action lambda:InvokeFunctionUrl \
+  --principal '*' \
+  --function-url-auth-type NONE
+
+# ② 関数呼び出しの許可（Function URL 経由に限定する）
+aws lambda add-permission --function-name gate-api \
+  --statement-id FunctionUrlInvokeFunction \
+  --action lambda:InvokeFunction \
+  --principal '*' \
+  --invoked-via-function-url
+```
+
+**②の `--invoked-via-function-url` が要点です。** これが無いと `lambda:InvokeFunction` を
+誰にでも開くことになり、**Function URL 以外の経路（SDK からの直接呼び出し）まで公開**されます。
+条件を付けることで、許可の範囲が「URL 経由で来たものだけ」に閉じます。
+
+> **【重要】`--action` を間違えないこと。**
+> Function URL に使うのは `lambda:InvokeFunctionUrl` です。`lambda:InvokeFunction` は別物で、
+> ②のように条件を付けて使います。名前が似ていて、片方だけ入れても
+> エラーではなく **403 が返るだけ**なので、原因が分かりにくい形で詰まります。
+
+**効いているポリシーを読む手段を、最初から持っておくこと。**
+
+```bash
+aws lambda get-policy --function-name gate-api --query 'Policy' --output text | python3 -m json.tool
+```
+
+実測では、作業用ユーザに `lambda:GetPolicy` を入れておらず、**このコマンドが使えませんでした。**
+そのため「いま何が許可されているか」を読めず、切り分けに時間がかかりました。
+最小権限で始めるのは正しいのですが、**壊れたときに中を見るための読み取り権限は例外**です。
+`infra/deployer-policy.json` には追加済みです。
+
 **IAM 認証に変えることもできます**が、その場合は curl も画面も SigV4 で署名する必要があり、
 README に載せている「curl でそのまま叩ける」形が崩れます。
 短時間で止める前提なら、`NONE` のままで進めるほうが筋が通ると考えています。
