@@ -255,7 +255,7 @@ aws iam put-role-policy --role-name gate-api-role \
 >
 > 実測で踏みました。zsh では `$ACCOUNT_ID:role/...` と書くと、**`:r` を
 > 「変数の修飾子」として解釈**して食べてしまい、ARN が
-> `arn:aws:iam::548088753519ole/gate-api-role` になります（`:r` が消える）。
+> `arn:aws:iam::123456789012ole/gate-api-role` になります（`:r` が消える）。
 > bash では起きませんが、macOS の既定シェルは zsh です。
 
 ```bash

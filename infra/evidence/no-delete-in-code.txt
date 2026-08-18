@@ -1,0 +1,7 @@
+audit_logs に対する削除の呼び出しは、コードのどこにもありません。
+
+検索: grep -rn "delete_item|DeleteItem|delete-item" crates/
+結果: 一致なし
+
+IAM の Deny（infra/evidence/iam-simulate-audit.json）と合わせて、
+アプリ側にも権限側にも削除の経路が無いことになります。

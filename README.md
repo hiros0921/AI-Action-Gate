@@ -8,7 +8,8 @@ LOW は自動承認、MEDIUM と HIGH は承認待ちキューへ回る。
 Rust（判定エンジンとAPI）/ Svelte（承認ダッシュボード）/ AWS（実行基盤）。
 
 > **この README は、なぜそう作ったかを書いたものです。**
-> 段階ごとに追記していきます（現在：第5段階まで）。
+> 第8段階まで完了しています。AWS 上で動かして確認したあと、**その日のうちに削除しました**
+> （[実行の記録](infra/evidence/aws-run.txt)・[削除の確認](infra/evidence/teardown.txt)）。
 
 ---
 
@@ -18,7 +19,7 @@ Rust（判定エンジンとAPI）/ Svelte（承認ダッシュボード）/ AWS
 第5段階まではDBも外部サービスも要りません。
 
 ```bash
-cargo test                      # 103件。サーバもDBも立てずに全部通る
+cargo test                      # 104件。サーバもDBも立てずに全部通る
 cargo run -p gate-api           # http://127.0.0.1:8090（メモリに保存）
 ```
 
@@ -40,7 +41,13 @@ GATE_DYNAMO_ENDPOINT=http://localhost:18000 AWS_ACCESS_KEY_ID=local \
 
 ```bash
 cd dashboard && npm install && npm run dev    # http://localhost:5173
+
+# AWS 上の API に向ける場合（向け先は vite.config.js の1か所だけ）
+GATE_API=https://xxxx.lambda-url.ap-northeast-1.on.aws npm run dev
 ```
+
+**画面に API の場所を焼き込んでいません。** 開発サーバのプロキシ経由で行くので、
+ローカルから AWS へ向け先を変えたときの変更は `vite.config.js` の3行で済みました。
 
 疑似エージェントから要求を投げます。
 
@@ -426,6 +433,138 @@ cargo run -p gate-lab -- thresholds   # 閾値案の比較（重みは固定）
 
 ---
 
+## AWS 上で動かした記録（第7段階）
+
+**東京リージョンに Lambda + DynamoDB で構築し、3経路を通してから、同じ日に削除しました。**
+証跡は `infra/evidence/` に置いてあります。手順は [`infra/DEPLOY.md`](infra/DEPLOY.md)、
+削除は [`infra/teardown.sh`](infra/teardown.sh) にあります。
+
+### 画面（データはすべて AWS の Lambda と DynamoDB から来ています）
+
+承認待ち。**右上の「suwa として操作しています」は常時表示**です（後述の[認証の設計](#認証は意図的に実装していません)）。
+
+![承認待ちキュー](infra/evidence/queue.png)
+
+閾値シミュレーション。**このシステムの中心**です。MEDIUM の境目を 20 → 50 に上げると、
+46点の2件が人の承認を通らなくなります。**そのうち2件が PII を含む**ことまで警告に出ます。
+
+![閾値シミュレーション](infra/evidence/simulate.png)
+
+監査ログ。**そのときの閾値（20/55）と、判定した基準の版（adopted-v1）が各行に残ります。**
+あとから閾値を変えても、過去の判断が「どの基準で下されたか」は動きません。
+
+![監査ログ](infra/evidence/audit.png)
+
+承認者IDを入れていない状態。**API が 401 を返すので、誰が承認したか空の記録は作れません。**
+
+![承認者ID未入力](infra/evidence/queue-no-approver.png)
+
+### 3経路の通し
+
+`aws lambda invoke` を10回。全文は [`infra/evidence/aws-run.txt`](infra/evidence/aws-run.txt) です。
+
+| | 内容 | 点数 | 結果 |
+|---|---|---|---|
+| LOW | 社内の読み取り・PIIなし | **6** | 自動承認。監査ログに `reviewer: system` で残る |
+| MEDIUM | 社外への書き込み・メールアドレス1件 | **46** | 承認待ち → `suwa` が承認 |
+| HIGH | 外部AIへ個人情報（電話・生年月日・氏名） | **100** | 承認待ち＋マスキング案 → `suwa` が拒否 |
+
+**点数はローカルの実行と完全に一致しました。** 判定が I/O から独立しているので、
+保存先がメモリでも DynamoDB でも結果が変わりません。
+
+二重承認は **HTTP 409**。DynamoDB の条件式（`attribute_not_exists(decided_at)`）で弾いています。
+アプリ側で「取ってから確かめて書く」would-be 競合を作らず、書き込みの原子性に寄せました。
+
+### 監査ログが消せないことを、実行せずに証明する
+
+`aws iam simulate-principal-policy` で、Lambda 実行ロールが `audit_logs` に対して何をできるかを
+IAM 自身に答えさせました（[`iam-simulate-audit.json`](infra/evidence/iam-simulate-audit.json)）。
+
+```
+dynamodb:PutItem            allowed        ← 追記はできる
+dynamodb:Query              allowed        ← 読める
+dynamodb:GetItem            allowed
+dynamodb:UpdateItem         explicitDeny   ← 直せない
+dynamodb:DeleteItem         explicitDeny   ← 消せない
+dynamodb:BatchWriteItem     explicitDeny   ← まとめても消せない
+dynamodb:DeleteTable        explicitDeny   ← テーブルごとも消せない
+dynamodb:UpdateTimeToLive   explicitDeny   ← TTL を付けて消させることもできない
+```
+
+**`explicitDeny` は「権限を与え忘れている」ではなく「明示的に禁じてある」です。**
+あとから広い Allow を足しても覆りません。ここが `implicitDeny` との違いで、
+「運用でうっかり権限を広げた」ときに効きます。
+
+**`BatchWriteItem` と `UpdateTimeToLive` を含めたのが要点です。**
+`DeleteItem` だけを拒否しても、`BatchWriteItem` の中に `DeleteRequest` を入れれば消せます。
+TTL も同じで、消す権限が無くても「30秒後に消える」設定を書けば消せてしまいます。
+**削除は1つの API 名ではありません。**
+
+コード側にも削除の経路が無いことを [`no-delete-in-code.txt`](infra/evidence/no-delete-in-code.txt) に残しました。
+
+### 見積もりと違ったところ — API Gateway を使いませんでした
+
+**下の見積もりは API Gateway 前提ですが、実際は Lambda Function URL にしました。**
+
+1画面・1関数で、API Gateway の機能（複数ルートの束ね・オーソライザ・スロットリング・
+ステージ）を1つも使いません。**使わないものを間に挟むと、料金だけでなく設定と障害点が増えます。**
+
+結果として、見積もりで唯一「13ヶ月目から課金が始まる」と書いた項目が消えました。
+Function URL にはリクエスト課金がなく、Lambda の呼び出し料金に含まれます。
+
+| | 見積もり（API Gateway） | 実際（Function URL） |
+|---|---|---|
+| 12ヶ月以内 | 約 $0.05/月 | 約 $0.05/月 |
+| 13ヶ月目以降 | 約 $0.3/月 | **約 $0.05/月のまま** |
+
+### 詰まったところ
+
+**プロトタイプでも、AWS に載せた時点で新しい失敗が3つ出ました。** 全部残しておきます。
+
+**① 起動と同時にテーブルを作ろうとして落ちた（`Runtime.ExitError exit status 2`）**
+
+ローカル開発の都合で、API は起動時に `ensure_tables()` を呼んでいました。
+Lambda の実行ロールには最小権限しか渡していないので `CreateTable` が拒否され、
+起動そのものが失敗しました。
+
+**直したのはロールではなくアプリです。**
+
+```rust
+// AWS 上のテーブルはデプロイ手順が作る。
+// Lambda のロールには CreateTable も ListTables も渡していない（最小権限）。
+if std::env::var("AWS_LAMBDA_FUNCTION_NAME").is_err() {
+    gate_store::ensure_tables(&client).await?;
+}
+```
+
+ロールに `CreateTable` を足せば5秒で直りますが、**それはアプリの都合で権限を広げること**です。
+テーブルを作るのは構築の作業であって、実行時の仕事ではありません。
+
+**② ロググループができず、ログの保持期間を設定できなかった**
+
+`logs:CreateLogGroup` をロールに入れ忘れていました。足しても直らず、
+**関数の設定を1つ更新して実行環境を作り直させたら**、初回の呼び出しでロググループができました。
+Lambda の実行環境は起動時に取得した認証情報を使い回すので、
+**ロールを直しても、動いている実行環境にはすぐ反映されません。**
+
+**③ Function URL が 403 を返し続けた**
+
+`AuthType=NONE` にして、`Principal: "*"` の resource-based policy も入れているのに
+`AccessDeniedException` が返る状態が続きました。最終的に、**statement-id を変えて
+同じ権限を入れ直したら通りました。**
+
+**原因は特定できていません。** 関数を削除したあとなので、これ以上は追えません。
+ただ、切り分けが遅れた理由ははっきりしています。**作業用ユーザに `lambda:GetPolicy` を
+入れていなかったため、「いま実際に効いているポリシー」を最後まで読めませんでした。**
+最小権限で始めたこと自体は正しいのですが、**壊れたときに中を見るための読み取り権限は、
+最初から入れておくべき**でした。
+
+この間も、`aws lambda invoke` で関数が正常に動くことは確認できていました。
+**URL は入口であって、確かめたいものではありません。** 通し確認を invoke で組んであるのは、
+入口の設定に確認手順が巻き込まれないようにするためです。
+
+---
+
 ## AWS の想定月額（第7段階のデプロイ前）
 
 ### 前提
@@ -519,39 +658,35 @@ aws logs put-retention-policy --log-group-name /aws/lambda/gate-api --retention-
 
 ---
 
-## 止め方（デプロイしたあと）
+## 止め方（実行済み）
 
-**このプロジェクトは実績づくりで、運用しません。** 動作確認とスクリーンショットが済んだら止めます。
-
-消し忘れると課金が続くものを、順に消します。
+**このプロジェクトは実績づくりで、運用しません。** 動作確認とスクリーンショットが済んだ日に止めました。
 
 ```bash
-# ① API Gateway（12ヶ月を過ぎるとリクエスト課金）
-aws apigatewayv2 delete-api --api-id <API_ID>
-
-# ② Lambda 関数
-aws lambda delete-function --function-name gate-api
-
-# ③ DynamoDB の3テーブル（保存が課金対象。25GBまでは無料だが、消し忘れない）
-aws dynamodb delete-table --table-name action_requests
-aws dynamodb delete-table --table-name request_payloads
-aws dynamodb delete-table --table-name audit_logs
-
-# ④ CloudWatch Logs のロググループ
-#    【重要】Lambda を消してもロググループは残ります。ここが消し忘れの定番。
-aws logs delete-log-group --log-group-name /aws/lambda/gate-api
-
-# ⑤ IAM ロールとポリシー（課金はされないが、残すと権限が残る）
-aws iam delete-role-policy --role-name gate-api-role --policy-name gate-api-policy
-aws iam delete-role --role-name gate-api-role
-
-# ⑥ 消え残りがないか確認
-aws dynamodb list-tables
-aws logs describe-log-groups --log-group-name-prefix /aws/lambda/gate
-aws apigatewayv2 get-apis --query 'Items[].Name'
+bash infra/teardown.sh
 ```
 
-**AWS Budgets のアラートは残して構いません**（無料）。消し忘れに気づく最後の砦になります。
+消すコマンドを並べただけのスクリプトにはしていません。**消えたことを1件ずつ確認して、
+出力を [`infra/evidence/teardown.txt`](infra/evidence/teardown.txt) に残します。**
+「消したつもりで残っていた」が、この手のいちばんよくある事故だからです。
+
+消したもの。
+
+| | 消し忘れると |
+|---|---|
+| Lambda 関数と Function URL | 呼ばれれば課金。URL は推測しにくいだけで秘密ではない |
+| DynamoDB 3テーブル | 保存が課金対象（25GBまでは無料） |
+| **ロググループ `/aws/lambda/gate-api`** | **Lambda を消しても残る。消し忘れの定番** |
+| IAM ロールとポリシー | 課金はされないが、権限が残る |
+| 作業用ユーザのアクセスキー | 無効化。削除ではないので、必要なら戻せる |
+
+残したものが2つあります。
+
+- **予算アラート（$5 / $8）** — 無料で、消し忘れに気づく最後の砦になる
+- **IAM ユーザ `gate-deployer`** — キーだけ無効化。作り直す手間を省くため
+
+スクリプトに `set -e` を付けていないのは、**「すでに無い」も正常だから**です。
+途中で止めず最後まで流して、確認結果を全部残すほうが目的に合います。
 
 ---
 
@@ -572,6 +707,32 @@ policies/      採用された設定
 ルーティングもSSRも要らない1画面なので、仕様書10章「大規模なフロントエンドフレームワークを
 追加しない」に沿ってこちらにしました。
 
+## 完成条件
+
+仕様書12章の19項目。**確かめ方を添えてあります。** 「動きました」だけでは検収できないためです。
+
+| | 条件 | 確かめ方 |
+|---|---|---|
+| ✅ | 疑似エージェントからのJSONで、判定から承認まで通る | `cargo run -p gate-agent -- send --scenario high --wait` |
+| ✅ | LOW / MEDIUM / HIGH の3経路がすべて動作する | [`aws-run.txt`](infra/evidence/aws-run.txt)（AWS 上・6/46/100点） |
+| ✅ | リスクスコアの内訳が表示される | 画面「内訳を見る」／`GET /api/queue` の `components` |
+| ✅ | PIIが検出され、マスキングプレビューが出る | [`queue.png`](infra/evidence/queue.png)・`masked_preview` |
+| ✅ | 氏名の検出に確信度が付いている | `Confidence::{High,Medium,Low}`。敬称・ラベル／姓辞書／形のみで分ける |
+| ✅ | 「検出できなかった」と「無かった」が型で分かれている | `Scan::Scanned` / `Scan::NotScanned` |
+| ✅ | 閾値を変えると、過去の要求の分岐がシミュレーションできる | [`simulate.png`](infra/evidence/simulate.png) |
+| ✅ | 閾値・重みが設定として外出しされている | `policies/adopted.toml`（`GATE_POLICY` で差し替え） |
+| ✅ | 監査ログが更新・削除できない（IAMで拒否） | [`iam-simulate-audit.json`](infra/evidence/iam-simulate-audit.json)（5件 `explicitDeny`） |
+| ✅ | 監査ログに「そのときの閾値」が残っている | [`audit.png`](infra/evidence/audit.png)（各行に `20/55` と `adopted-v1`） |
+| ✅ | 監査ログに平文のPIIが残っていない | 監査ログは**種別と件数だけ**。平文は別テーブル（`request_payloads`） |
+| ✅ | 判定ロジックがI/Oから独立し、単体テストで完結する | `gate-core` は tokio も aws-sdk も依存に持たない。`cargo test` |
+| ✅ | ダッシュボードがリアルタイムに更新される | 3秒ポーリング＋ETag/304（`GATE_POLL_MS`） |
+| ✅ | AWS上で動作する | [`aws-run.txt`](infra/evidence/aws-run.txt)（10回の invoke がすべて成功） |
+| ✅ | AWS認証情報がコードに直書きされていない | 実行時は IAM ロール。ローカルは環境変数 |
+| ✅ | 実在の個人情報・企業名がサンプルに含まれていない | 氏名は架空、メールは `example.com`、電話は `090-1234-5678` |
+| ✅ | README に Rust・Svelte・AWS それぞれの選定理由が書かれている | [技術の選定理由](#技術の選定理由) |
+| ✅ | README に SQS を使わなかった理由が書かれている | [SQS を使わなかった理由](#sqs-を使わなかった理由) |
+| ✅ | GitHubへpushしていない（承認前） | ローカルの git のみ |
+
 ## 進捗
 
 - [x] 第2段階：判定コア（I/Oなし）
@@ -579,7 +740,10 @@ policies/      採用された設定
 - [x] 第4段階：スコアリング基準の選定（実測して採用）
 - [x] 第5段階：Svelte ダッシュボード
 - [x] 第6段階：DynamoDB 永続化と監査ログ
-- [ ] 第7段階：AWS へのデプロイ
-- [ ] 第8段階：通し確認と README 仕上げ
+- [x] 第7段階：AWS へのデプロイ（**確認後、同日に削除済み**）
+- [x] 第8段階：通し確認と README 仕上げ
+
+**ここで完成です。** 仕様書13章のとおり、決済・本物のエージェント・Bedrock 接続・
+複数テナント・通知・SQS・認証基盤の作り込みには着手していません。
 
 サンプルに出てくる氏名・電話番号・生年月日・企業名は**すべて架空**です。

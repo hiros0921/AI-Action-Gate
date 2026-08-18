@@ -1,0 +1,42 @@
+=== 削除 ===
+日時: 2026-08-19 06:12:45 JST
+リージョン: ap-northeast-1
+
+-- Lambda --
+    "StatusCode": 204
+}
+  削除コマンドを実行しました
+-- DynamoDB --
+DELETING
+DELETING
+DELETING
+-- CloudWatch Logs --
+  削除コマンドを実行しました
+-- IAM ロール --
+  削除コマンドを実行しました
+
+テーブルが消えるまで待ちます（DynamoDB の削除は非同期）...
+待機終了
+
+=== 消えたことの確認 ===
+（すべて「なし」なら、課金対象は残っていません）
+
+  Lambda 関数 gate-api: なし
+  テーブル action_requests: なし
+  テーブル request_payloads: なし
+  テーブル audit_logs: なし
+  IAM ロール gate-api-role: なし
+  ロググループ /aws/lambda/gate-api: なし
+
+-- 念のため、このリージョンに他の残りが無いか --
+  Lambda 関数: 0 個
+  DynamoDB テーブル: 
+
+=== 残したもの ===
+  予算アラート（$5 / $8）: 残す。無料で、消し忘れの保険になる
+  IAM ユーザ gate-deployer: 残す。ただしアクセスキーは次の手順で無効化する
+
+=== 次にやること（手で実行） ===
+  aws iam list-access-keys --user-name gate-deployer
+  aws iam update-access-key --user-name gate-deployer --access-key-id <ID> --status Inactive
+  ※ 無効化するとこの端末から AWS を触れなくなります。上の確認が済んでから。
