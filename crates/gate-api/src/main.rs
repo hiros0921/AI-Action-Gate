@@ -88,6 +88,25 @@ async fn main() {
     let state = Arc::new(AppState::new(store, policy).with_store_kind(store_kind));
     let app = routes::router(state).layer(CorsLayer::permissive());
 
+    // ── ここが唯一の分岐 ───────────────────────────────────
+    //
+    // 【重要】Lambda の上では、ポートを開いて待ち受けてはいけません。
+    // ランタイムが呼び出しを渡してくるので、それを受ける形に変わります。
+    //
+    // 変わるのはこの数行だけで、ルーティングもハンドラも判定も同じものを使います。
+    // axum を選んだ理由がここに出ます（lambda_http が Router をそのまま受け取れる）。
+    //
+    // AWS_LAMBDA_FUNCTION_NAME は Lambda が必ず入れる環境変数。
+    // 自分で設定するものではないので、取り違えが起きません。
+    if std::env::var("AWS_LAMBDA_FUNCTION_NAME").is_ok() {
+        tracing::info!("Lambda の上で動いています");
+        if let Err(e) = lambda_http::run(app).await {
+            eprintln!("Lambda ランタイムが落ちました: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // ポートは 8090。8080 は別のプロジェクト（mendan-training）が使っているため、
     // ぶつからないようずらしてある。GATE_ADDR で変えられる。
     let addr: SocketAddr = std::env::var("GATE_ADDR")

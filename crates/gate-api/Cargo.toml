@@ -16,6 +16,8 @@ serde_json.workspace = true
 chrono.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 tower-http = { workspace = true, features = ["cors", "trace"] }
+# Lambda の入口。axum の Router をそのまま渡せるので、ハンドラは変えずに済む。
+lambda_http = "0.14"
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
