@@ -251,9 +251,20 @@ aws iam put-role-policy --role-name gate-api-role \
 
 ## 5. Lambda（💰 課金対象）
 
+> **【重要】`${ACCOUNT_ID}` と波かっこで囲むこと。**
+>
+> 実測で踏みました。zsh では `$ACCOUNT_ID:role/...` と書くと、**`:r` を
+> 「変数の修飾子」として解釈**して食べてしまい、ARN が
+> `arn:aws:iam::548088753519ole/gate-api-role` になります（`:r` が消える）。
+> bash では起きませんが、macOS の既定シェルは zsh です。
+
 ```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/gate-api-role"
+echo "使うロール: $ROLE_ARN"     # :role/ が入っているか目で確かめる
+
 cargo lambda deploy gate-api \
-  --iam-role arn:aws:iam::$ACCOUNT_ID:role/gate-api-role \
+  --iam-role "$ROLE_ARN" \
   --env-var GATE_STORE=dynamodb \
   --env-var GATE_POLL_MS=3000 \
   --env-var RUST_LOG=info \
@@ -338,8 +349,9 @@ curl -s "${URL}api/queue"
 出力をそのまま証跡として残せます。
 
 ```bash
-ROLE_ARN=arn:aws:iam::$ACCOUNT_ID:role/gate-api-role
-AUDIT_ARN=arn:aws:dynamodb:ap-northeast-1:$ACCOUNT_ID:table/audit_logs
+# 【重要】zsh が :r を修飾子として食べるので、必ず波かっこで囲む
+ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/gate-api-role"
+AUDIT_ARN="arn:aws:dynamodb:ap-northeast-1:${ACCOUNT_ID}:table/audit_logs"
 
 aws iam simulate-principal-policy \
   --policy-source-arn "$ROLE_ARN" \
