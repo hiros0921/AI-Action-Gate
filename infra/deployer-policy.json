@@ -86,6 +86,18 @@
       "Resource": "arn:aws:iam::ACCOUNT_ID:role/gate-api-role"
     },
     {
+      "Sid": "IamReadOwnUser",
+      "Comment3": [
+        "自分の権限を確認するためだけの読み取り。実測で足りないと分かった:",
+        "  aws iam list-attached-user-policies --user-name gate-deployer",
+        "を確認コマンドとして書いていたのに、その権限を入れ忘れていた。",
+        "自分自身のユーザにだけ効くよう Resource で限定してある。"
+      ],
+      "Effect": "Allow",
+      "Action": ["iam:ListAttachedUserPolicies", "iam:GetUser"],
+      "Resource": "arn:aws:iam::ACCOUNT_ID:user/gate-deployer"
+    },
+    {
       "Sid": "IamReadOnlyForVerification",
       "Effect": "Allow",
       "Action": [
