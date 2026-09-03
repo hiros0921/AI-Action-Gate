@@ -10,7 +10,12 @@
     "",
     "このコメントは説明用。aws iam create-policy に渡す前に削除すること。",
     "権限が足りずに AccessDenied が出たら、エラー文に不足しているアクション名が",
-    "書いてあるので、それをここへ足す。先に広げない。"
+    "書いてあるので、それをここへ足す。先に広げない。",
+    "",
+    "【2026-09-03 追記】Terraform / OpenTofu から使うために追加した権限がある。",
+    "AWS プロバイダは、タグを設定していなくても refresh のたびに",
+    "タグを問い合わせる。そのため CLI 手順では不要だった ListTags 系が要る。",
+    "追加分には Comment4 を付けて、理由を残した。"
   ],
   "Version": "2012-10-17",
   "Statement": [
@@ -30,13 +35,20 @@
         "dynamodb:GetItem",
         "dynamodb:UpdateItem",
         "dynamodb:Query",
-        "dynamodb:Scan"
+        "dynamodb:Scan",
+        "dynamodb:ListTagsOfResource",
+        "dynamodb:TagResource",
+        "dynamodb:UntagResource"
       ],
       "Resource": [
         "arn:aws:dynamodb:ap-northeast-1:ACCOUNT_ID:table/action_requests",
         "arn:aws:dynamodb:ap-northeast-1:ACCOUNT_ID:table/action_requests/index/*",
         "arn:aws:dynamodb:ap-northeast-1:ACCOUNT_ID:table/request_payloads",
         "arn:aws:dynamodb:ap-northeast-1:ACCOUNT_ID:table/audit_logs"
+      ],
+      "Comment4": [
+        "【Terraform 用に追加】ListTagsOfResource は refresh のたびに呼ばれる。",
+        "タグを一切設定していなくても呼ばれるので、CLI 手順では不要だった。"
       ]
     },
     {
@@ -63,9 +75,24 @@
         "lambda:RemovePermission",
         "lambda:GetPolicy",
         "lambda:InvokeFunction",
-        "lambda:InvokeFunctionUrl"
+        "lambda:InvokeFunctionUrl",
+        "lambda:ListTags",
+        "lambda:TagResource",
+        "lambda:UntagResource",
+        "lambda:GetRuntimeManagementConfig",
+        "lambda:GetFunctionCodeSigningConfig",
+        "lambda:ListVersionsByFunction"
       ],
-      "Resource": "arn:aws:lambda:ap-northeast-1:ACCOUNT_ID:function:gate-api"
+      "Resource": "arn:aws:lambda:ap-northeast-1:ACCOUNT_ID:function:gate-api",
+      "Comment4": [
+        "【Terraform 用に追加】ListTags は refresh で必ず呼ばれる。",
+        "GetRuntimeManagementConfig / GetFunctionCodeSigningConfig も",
+        "プロバイダが関数の状態を読むときに呼ぶ。",
+        "",
+        "【実測 2026-09-03・3回目】ListVersionsByFunction。関数を作った直後に",
+        "プロバイダが最新バージョンを読むために呼ぶ。CreateFunction は通ったが",
+        "その読み戻しで止まった。予測に入れていなかった。"
+      ]
     },
     {
       "Sid": "ListFunctionsNeedsWildcard",
@@ -83,9 +110,27 @@
         "iam:PutRolePolicy",
         "iam:GetRolePolicy",
         "iam:DeleteRolePolicy",
-        "iam:PassRole"
+        "iam:PassRole",
+        "iam:ListRolePolicies",
+        "iam:ListRoleTags",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole"
       ],
-      "Resource": "arn:aws:iam::ACCOUNT_ID:role/gate-api-role"
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/gate-api-role",
+      "Comment4": [
+        "【Terraform 用に追加】ListRolePolicies はインラインポリシーの",
+        "一覧を取るために呼ばれる。CLI では GetRolePolicy を名前指定で",
+        "呼んでいたので不要だった。",
+        "",
+        "【実測 2026-09-03・2回目】ListRolePolicies だけでは足りなかった。",
+        "  iam:ListRolePolicies         = インラインポリシーの名前一覧",
+        "  iam:ListAttachedRolePolicies = アタッチ済みマネージドポリシーの一覧",
+        "プロバイダは aws_iam_role の read で両方を呼ぶ。名前が似ていて、",
+        "片方だけでは AccessDenied になる。",
+        "ListInstanceProfilesForRole は予測で入れた（destroy 時に読まれる）。"
+      ]
     },
     {
       "Sid": "IamReadOwnUser",
@@ -96,7 +141,10 @@
         "自分自身のユーザにだけ効くよう Resource で限定してある。"
       ],
       "Effect": "Allow",
-      "Action": ["iam:ListAttachedUserPolicies", "iam:GetUser"],
+      "Action": [
+        "iam:ListAttachedUserPolicies",
+        "iam:GetUser"
+      ],
       "Resource": "arn:aws:iam::ACCOUNT_ID:user/gate-deployer"
     },
     {
@@ -119,9 +167,18 @@
         "logs:DescribeLogGroups",
         "logs:DeleteLogGroup",
         "logs:GetLogEvents",
-        "logs:FilterLogEvents"
+        "logs:FilterLogEvents",
+        "logs:CreateLogGroup",
+        "logs:ListTagsForResource",
+        "logs:TagResource",
+        "logs:UntagResource"
       ],
-      "Resource": "*"
+      "Resource": "*",
+      "Comment4": [
+        "【Terraform 用に追加】CreateLogGroup が要る。CLI 手順では Lambda が",
+        "初回実行時に自動生成していたが、Terraform では保持期間を先に",
+        "決めるため明示的に作る（lambda.tf のコメント参照）。"
+      ]
     },
     {
       "Sid": "BudgetsAndIdentity",
@@ -134,8 +191,20 @@
         "  aws budgets create-budget    → budgets:ModifyBudget で認可",
         "  aws budgets describe-budgets → budgets:ViewBudget で認可"
       ],
-      "Action": ["budgets:ViewBudget", "budgets:ModifyBudget", "sts:GetCallerIdentity"],
-      "Resource": "*"
+      "Action": [
+        "budgets:ViewBudget",
+        "budgets:ModifyBudget",
+        "sts:GetCallerIdentity",
+        "budgets:ListTagsForResource",
+        "budgets:TagResource",
+        "budgets:UntagResource"
+      ],
+      "Resource": "*",
+      "Comment4": [
+        "【Terraform 用に追加】ListTagsForResource が無いと import が失敗する。",
+        "実測 2026-09-03: DuplicateRecordException を import で回避しようとして、",
+        "今度は budgets:ListTagsForResource で止まった。"
+      ]
     }
   ]
 }

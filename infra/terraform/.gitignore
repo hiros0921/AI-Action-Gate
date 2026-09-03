@@ -1,0 +1,17 @@
+# 【重要】state には12桁のアカウントID・Function URL・ARN が平文で入る。
+# DEPLOY.md では証跡から sed で伏せる手順を入れていた。state を
+# コミットすると、その作業が無意味になる。しかも履歴からは消せない。
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# 通知先のメールアドレスが入る
+*.tfvars
+!*.tfvars.example
+
+# archive_file が作る zip
+.build/
+
+# plan の出力（差分にリソース名とARNが載る）
+*.tfplan
